@@ -575,33 +575,7 @@ func (c *Checker) validateTransactionRead(maxTicket uint64, ledger string, id ui
 			return false // base has a tx at this id, but the server returned NotFound
 		}
 
-		rec := txs[id-1]
-		// A user-supplied timestamp is echoed verbatim; when the model has none
-		// (nil) the server stamped its own command date, which is unpredictable,
-		// so the timestamp is not checked for that record.
-		tsOK := rec.Timestamp() == nil || rec.Timestamp().GetData() == serverTx.GetTimestamp().GetData()
-
-		// reverted_at follows the same convention: nil in the model means the
-		// compensating transaction was server-dated (unpredictable) — but only a
-		// reverted record may carry one at all.
-		var raOK bool
-		switch {
-		case rec.RevertedAt() != nil:
-			raOK = serverTx.GetRevertedAt() != nil && rec.RevertedAt().GetData() == serverTx.GetRevertedAt().GetData()
-		case rec.Reverted():
-			raOK = true
-		default:
-			raOK = serverTx.GetRevertedAt() == nil
-		}
-
-		return rec.Id() == serverTx.GetId() &&
-			rec.Reference() == serverTx.GetReference() &&
-			rec.Reverted() == serverTx.GetReverted() &&
-			rec.RevertedBy() == serverTx.GetRevertedByTransaction() &&
-			rec.RevertsTransaction() == serverTx.GetRevertsTransaction() &&
-			tsOK && raOK &&
-			postingsEqual(rec.Postings(), serverTx.GetPostings()) &&
-			metaMapEqual(rec.Metadata(), serverTx.GetMetadata())
+		return txRecordMatches(txs[id-1], serverTx)
 	}) {
 		return
 	}
