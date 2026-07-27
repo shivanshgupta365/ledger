@@ -261,7 +261,6 @@ func (fsm *Machine) applyMirrorSyncUpdate(scope processing.Scope, buffer *WriteS
 
 	buffer.QueueMirrorSync(MirrorSyncWrite{
 		LedgerName:     ledgerInfo.GetName(),
-		Cursor:         update.GetCursor(),
 		SourceLogCount: update.GetSourceLogCount(),
 		ClearError:     update.GetClearError(),
 		Error:          update.GetError(),
