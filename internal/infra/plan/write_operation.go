@@ -11,7 +11,7 @@ package plan
 // without wiring Target (test scenarios), and an operation with no
 // reads may still want a (zero) bitset assigned to pin "I read
 // nothing" explicitly. In practice the common cases are either both
-// filled (admission orders, mirror cursor) or both nil (cluster
+// filled (admission orders, mirror ingest) or both nil (cluster
 // config, idempotency eviction, events sink — TUs whose handlers
 // don't read cache state).
 type WriteOperation struct {
