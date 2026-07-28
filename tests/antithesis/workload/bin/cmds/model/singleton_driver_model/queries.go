@@ -54,7 +54,9 @@ func queryPageSize() int {
 func runAccountQuery(ctx context.Context, client servicepb.BucketServiceClient, c *Checker) {
 	ledger := random.RandomChoice(c.ledgerNames)
 	filter := genAccountFilter()
-	needsIndex := filterNeedsIndex(filter, commonpb.QueryTarget_QUERY_TARGET_ACCOUNTS)
+	assetNeed, otherNeed := indexNeeds(filter, commonpb.QueryTarget_QUERY_TARGET_ACCOUNTS)
+	needsIndex := assetNeed || otherNeed
+	assetOnly := assetNeed && !otherNeed
 	invalidTarget := filterInvalidForTarget(filter, commonpb.QueryTarget_QUERY_TARGET_ACCOUNTS)
 	pageSize := queryPageSize()
 	reverse := random.RandomChoice([]uint8{0, 1}) == 1
@@ -102,6 +104,12 @@ func runAccountQuery(ctx context.Context, client servicepb.BucketServiceClient, 
 		if handleInvalidTargetError(invalidTarget, "account", ledger, filter, err) {
 			return
 		}
+		if assetOnly {
+			// The account-by-asset index governs this filter's outcome; a not-ready
+			// error is legal while the index is absent or ambiguous.
+			c.validateAssetAccountQuery(maxTicket, ledger, filter, cursor, pageSize, reverse, nil, err)
+			return
+		}
 		if handleIndexGatedError(needsIndex, "account", ledger, filter, err) {
 			return
 		}
@@ -127,9 +135,14 @@ func runAccountQuery(ctx context.Context, client servicepb.BucketServiceClient, 
 		return
 	}
 
+	if assetOnly {
+		c.validateAssetAccountQuery(maxTicket, ledger, filter, cursor, pageSize, reverse, accounts, nil)
+		return
+	}
+
 	if needsIndex {
-		// Predicted NotFound but the server streamed rows: an index-backed filter
-		// returned results without the index the compiler requires.
+		// Predicted NotFound but the server streamed rows: a non-asset index-backed
+		// filter returned results without the index the compiler requires.
 		assert.Unreachable("singleton_driver_model: index-gated account query returned results", internal.Details{
 			"ledger": ledger,
 			"filter": describeFilter(filter),
@@ -414,7 +427,7 @@ func (c *Checker) modelTransactionWindow(ledger string, filter *commonpb.QueryFi
 func accountWindow(ls oracle.LedgerState, filter *commonpb.QueryFilter, cursor string, pageSize int, reverse bool) []string {
 	var window []string
 	for _, addr := range accountUniverse(ls) {
-		if matchAccountFilter(filter, addr) {
+		if matchAccountFilter(ls, filter, addr) {
 			window = append(window, addr)
 		}
 	}
@@ -616,14 +629,18 @@ func oneIn(n int) bool {
 }
 
 // genAccountFilter rolls a query filter for ListAccounts. One-in-six is an
-// index-backed metadata condition (the NotFound path); ~1-in-16 is a
-// transactions-only condition invalid on this target (the InvalidArgument path);
-// then one-in-four is the no-filter universe (a nil top-level filter); the rest
-// are index-free address filters and boolean compositions.
+// index-backed metadata condition the driver never creates (the gated / NotFound
+// path); one-in-six is an account-by-asset filter whose outcome the index
+// lifecycle governs (see genAccountAssetFilter); ~1-in-16 is a transactions-only
+// condition invalid on this target (the InvalidArgument path); then one-in-four
+// is the no-filter universe (a nil top-level filter); the rest are index-free
+// address filters and boolean compositions.
 func genAccountFilter() *commonpb.QueryFilter {
 	switch {
-	case random.RandomChoice([]uint8{0, 1, 2, 3, 4, 5}) == 0:
+	case oneIn(6):
 		return filterMetaExists(metaKey())
+	case oneIn(6):
+		return genAccountAssetFilter()
 	case oneIn(16):
 		// Target-invalid probe: a transactions-only condition, rejected on accounts.
 		if random.RandomChoice([]uint8{0, 1}) == 0 {
@@ -631,7 +648,7 @@ func genAccountFilter() *commonpb.QueryFilter {
 		}
 
 		return filterTxIDRange(0, 255)
-	case random.RandomChoice([]uint8{0, 1, 2, 3}) == 0:
+	case oneIn(4):
 		return nil // top-level universe (no filter)
 	default:
 		return genAccountFilterFree(0)
@@ -770,52 +787,62 @@ func filterHasAsset(assetBase string, precision uint32) *commonpb.QueryFilter {
 // --- Filter evaluation --------------------------------------------------
 
 // filterNeedsIndex reports whether f contains any condition the server's
-// compiler serves from a created index (query.Compile → requireIndexReady).
-// This workload builds none, so any such filter makes the list RPC fail with
-// NotFound instead of returning rows — the model predicts that outcome rather
-// than a result set. The index-free conditions are universe (nil), address on
-// accounts, reverted, and the tx-id builtin; every other leaf is index-backed.
-//
-// This is the seam for creating indexes on the fly later: it would then become
-// "needs an index that is not yet READY for the current replica".
+// compiler serves from a created index (query.Compile → requireIndexReady): the
+// account-by-asset builtin, or any other index-backed leaf (metadata Field,
+// Reference, timestamp builtins, address-on-transactions). The index-free
+// conditions are universe (nil), address on accounts, reverted, and the tx-id
+// builtin. See indexNeeds for the asset/other split the account-query lifecycle
+// path keys on.
 func filterNeedsIndex(f *commonpb.QueryFilter, target commonpb.QueryTarget) bool {
+	asset, other := indexNeeds(f, target)
+
+	return asset || other
+}
+
+// indexNeeds classifies f's index requirements into two buckets: `asset` is set
+// if any leaf needs the account-by-asset builtin (an AccountHasAsset condition),
+// `other` if any leaf needs a different index (metadata Field, Reference, a
+// timestamp builtin, address-on-transactions). A filter is asset-only — its
+// outcome governed by the account-by-asset lifecycle — iff asset && !other; the
+// driver creates only that index, so any `other` need means a missing index and
+// a rejected compile regardless. Combinators OR their children's needs; the
+// compiler fails the whole query on the first missing index, so a single
+// index-backed leaf anywhere sets the whole tree's need.
+func indexNeeds(f *commonpb.QueryFilter, target commonpb.QueryTarget) (asset, other bool) {
 	if f == nil {
-		return false
+		return false, false
 	}
 
 	switch x := f.GetFilter().(type) {
 	case *commonpb.QueryFilter_And:
 		for _, child := range x.And.GetFilters() {
-			if filterNeedsIndex(child, target) {
-				return true
-			}
+			a, o := indexNeeds(child, target)
+			asset, other = asset || a, other || o
 		}
-
-		return false
 	case *commonpb.QueryFilter_Or:
 		for _, child := range x.Or.GetFilters() {
-			if filterNeedsIndex(child, target) {
-				return true
-			}
+			a, o := indexNeeds(child, target)
+			asset, other = asset || a, other || o
 		}
-
-		return false
 	case *commonpb.QueryFilter_Not:
-		return filterNeedsIndex(x.Not.GetFilter(), target)
+		return indexNeeds(x.Not.GetFilter(), target)
+	case *commonpb.QueryFilter_AccountHasAsset:
+		return true, false
 	case *commonpb.QueryFilter_Reverted:
-		return false
+		return false, false
 	case *commonpb.QueryFilter_Address:
-		// Address matching is index-free only on accounts; on transactions it
-		// needs the account→tx index.
-		return target == commonpb.QueryTarget_QUERY_TARGET_TRANSACTIONS
+		// Index-free on accounts; on transactions it needs the account→tx index.
+		return false, target == commonpb.QueryTarget_QUERY_TARGET_TRANSACTIONS
 	case *commonpb.QueryFilter_BuiltinUint:
 		// Only the id builtin scans the always-present Pebble tx keyspace; the
 		// timestamp/inserted_at/reverted_at builtins need an index.
-		return x.BuiltinUint.GetField() != commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_ID
+		return false, x.BuiltinUint.GetField() != commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_ID
 	default:
-		// Field, Reference, AccountHasAsset, log conditions — all index-backed.
-		return true
+		// Field, Reference, log conditions — index-backed, non-asset.
+		return false, true
 	}
+
+	return asset, other
 }
 
 // filterInvalidForTarget reports whether f carries any condition the server's
@@ -855,10 +882,12 @@ func filterInvalidForTarget(f *commonpb.QueryFilter, target commonpb.QueryTarget
 	return false
 }
 
-// matchAccountFilter evaluates an index-free accounts filter against one
-// address. Empty And/Or match nothing, mirroring the compiler's empty-iterator
-// treatment; a nil node is the universe (always matches).
-func matchAccountFilter(f *commonpb.QueryFilter, addr string) bool {
+// matchAccountFilter evaluates an accounts filter against one address in ls.
+// Empty And/Or match nothing, mirroring the compiler's empty-iterator treatment;
+// a nil node is the universe (always matches). The AccountHasAsset arm needs the
+// account's volumes, so ls is threaded through even though the index-free arms
+// depend only on the address.
+func matchAccountFilter(ls oracle.LedgerState, f *commonpb.QueryFilter, addr string) bool {
 	if f == nil {
 		return true
 	}
@@ -873,12 +902,14 @@ func matchAccountFilter(f *commonpb.QueryFilter, addr string) bool {
 		}
 
 		return false
+	case *commonpb.QueryFilter_AccountHasAsset:
+		return accountHasAsset(ls, addr, x.AccountHasAsset.GetAssetBase(), x.AccountHasAsset.GetPrecision())
 	case *commonpb.QueryFilter_And:
-		return matchAll(x.And.GetFilters(), func(child *commonpb.QueryFilter) bool { return matchAccountFilter(child, addr) })
+		return matchAll(x.And.GetFilters(), func(child *commonpb.QueryFilter) bool { return matchAccountFilter(ls, child, addr) })
 	case *commonpb.QueryFilter_Or:
-		return matchAny(x.Or.GetFilters(), func(child *commonpb.QueryFilter) bool { return matchAccountFilter(child, addr) })
+		return matchAny(x.Or.GetFilters(), func(child *commonpb.QueryFilter) bool { return matchAccountFilter(ls, child, addr) })
 	case *commonpb.QueryFilter_Not:
-		return !matchAccountFilter(x.Not.GetFilter(), addr)
+		return !matchAccountFilter(ls, x.Not.GetFilter(), addr)
 	default:
 		return false
 	}

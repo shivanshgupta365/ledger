@@ -142,10 +142,28 @@ func main() {
 		log.Printf("restore cycle enabled (interval ~%s)", restoreInterval())
 	}
 
-	// Workers stop on ctx.Done. Wait for the restore cycle too before closing the
-	// processor's channel, so no cycle touches the checker during teardown.
+	// Index readiness poller: reconciles each created index's active flag against
+	// per-replica CurrentVersion, so has-asset queries validate results once the
+	// index is live everywhere. Per-node conns are lazy, so dialing never fails on
+	// a down node; it is skipped only when no addresses resolve.
+	var pollers sync.WaitGroup
+	if conns, err := internal.DialPerNode(ctx); err != nil {
+		log.Printf("index readiness poller disabled: per-node dial failed: %s", err)
+	} else {
+		pollers.Add(1)
+		go func() {
+			defer pollers.Done()
+			defer conns.Close()
+			runIndexReadinessPoller(ctx, checker, conns, indexPollInterval)
+		}()
+	}
+
+	// Workers stop on ctx.Done. Wait for the restore cycle and poller too before
+	// closing the processor's channel, so nothing touches the checker during
+	// teardown.
 	workers.Wait()
 	restore.Wait()
+	pollers.Wait()
 	close(checker.incoming)
 	processors.Wait()
 }

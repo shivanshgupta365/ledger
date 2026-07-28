@@ -137,11 +137,26 @@ func replayCommitted(batches []batch, target string) {
 	sort.SliceStable(batches, func(i, j int) bool { return batches[i].seq < batches[j].seq })
 	fmt.Printf("parsed %d committed batches\n", len(batches))
 
+	// MODEL_TRACE_SEQ=N stops the fold once a bulk's sequence exceeds N, so the
+	// final-state dumps reflect the committed prefix at that point (e.g. the
+	// sequence a finding was pinned to) rather than the whole log.
+	var traceSeq uint64
+	if s := os.Getenv("MODEL_TRACE_SEQ"); s != "" {
+		traceSeq, _ = strconv.ParseUint(s, 10, 64)
+	}
+
+	traceType := os.Getenv("MODEL_TRACE_TYPE")
+	traceAcct := os.Getenv("MODEL_TRACE_ACCOUNT")
+
 	gs := oracle.NewGlobalState()
 	touched := map[string]bool{}
 	rejected := 0
 
 	for _, b := range batches {
+		if traceSeq > 0 && b.seq > traceSeq {
+			break
+		}
+
 		// Only committed bulks form the server's log-ordered serialization. Skip
 		// failures/transients; a legacy dump carries no outcome — treat as
 		// committed.
@@ -165,6 +180,27 @@ func replayCommitted(batches []batch, target string) {
 			}
 		}
 
+		// MODEL_TRACE_TYPE=<name>: log every committed Add/RemoveAccountType for
+		// that type on the target ledger, to trace how its persistence evolves.
+		if traceType != "" {
+			for _, r := range bulk.Requests {
+				if target != "" && oracle.LedgerOf(r) != target {
+					continue
+				}
+				switch x := r.GetType().(type) {
+				case *servicepb.Request_AddAccountType:
+					at := x.AddAccountType.GetAccountType()
+					if at.GetName() == traceType {
+						fmt.Printf("seq=%-6d ADD    %s persistence=%d pattern=%s\n", b.seq, traceType, at.GetPersistence(), at.GetPattern())
+					}
+				case *servicepb.Request_RemoveAccountType:
+					if x.RemoveAccountType.GetName() == traceType {
+						fmt.Printf("seq=%-6d REMOVE %s\n", b.seq, traceType)
+					}
+				}
+			}
+		}
+
 		res := gs.Apply(bulk)
 		if !res.OK {
 			rejected++
@@ -173,6 +209,69 @@ func replayCommitted(batches []batch, target string) {
 			continue
 		}
 		gs = res.State
+
+		// Per-bulk account trace: any committed bulk whose postings touch the
+		// traced account prints the account's cells right after apply, plus
+		// whether the end-of-bulk chart still holds each type. Metadata ops
+		// targeting the account and reverts of transactions that touched it
+		// count as touches too.
+		if traceAcct != "" {
+			for _, r := range bulk.Requests {
+				hit := false
+				kind := "tx"
+				switch a := r.GetApply().GetAction().GetData().(type) {
+				case *servicepb.LedgerAction_CreateTransaction:
+					for _, p := range a.CreateTransaction.GetPostings() {
+						if p.GetSource() == traceAcct || p.GetDestination() == traceAcct {
+							hit = true
+						}
+					}
+				case *servicepb.LedgerAction_AddMetadata:
+					kind = "addMeta"
+					hit = a.AddMetadata.GetTarget().GetAccount().GetAddr() == traceAcct
+				case *servicepb.LedgerAction_DeleteMetadata:
+					kind = "delMeta"
+					hit = a.DeleteMetadata.GetTarget().GetAccount().GetAddr() == traceAcct
+				case *servicepb.LedgerAction_RevertTransaction:
+					kind = fmt.Sprintf("revert(%d)", a.RevertTransaction.GetTransactionId())
+					l := oracle.LedgerOf(r)
+					ls := gs.Ledger(l)
+					if id := a.RevertTransaction.GetTransactionId(); id >= 1 && id <= uint64(len(ls.Txs())) {
+						for _, p := range ls.Txs()[id-1].Postings() {
+							if p.GetSource() == traceAcct || p.GetDestination() == traceAcct {
+								hit = true
+							}
+						}
+					}
+				}
+				if !hit {
+					continue
+				}
+				l := oracle.LedgerOf(r)
+				ls := gs.Ledger(l)
+				var cells []string
+				for k, vp := range ls.Volumes() {
+					if k.Address == traceAcct {
+						cells = append(cells, fmt.Sprintf("%s in=%s out=%s", k.Asset, vp.Input.Dec(), vp.Output.Dec()))
+					}
+				}
+				sort.Strings(cells)
+				var metas []string
+				for k, v := range ls.Metadata() {
+					if k.Address == traceAcct {
+						metas = append(metas, k.Key+"="+oracle.MetaValueString(v))
+					}
+				}
+				sort.Strings(metas)
+				var chart []string
+				for name, t := range ls.Types() {
+					chart = append(chart, fmt.Sprintf("%s|%d", name, t.Persistence))
+				}
+				sort.Strings(chart)
+				fmt.Printf("seq=%-6d ticket=%-6d TOUCH %-10s %s postings=%s cellsAfter=[%s] metaAfter=[%s] chart=[%s]\n",
+					b.seq, b.ticket, kind, traceAcct, renderPostings(bulk), strings.Join(cells, ", "), strings.Join(metas, ","), strings.Join(chart, ","))
+			}
+		}
 
 		if hitsTarget {
 			ls := gs.Ledger(target)
@@ -190,6 +289,48 @@ func replayCommitted(batches []batch, target string) {
 		ls := gs.Ledger(l)
 		fmt.Printf("  %s meta=%s types=%d\n", l, renderMeta(ls.LedgerMeta()), len(ls.Types()))
 	}
+
+	// MODEL_TRACE_ACCOUNT=<addr>: print the final committed volume cells the model
+	// holds for that account across every ledger, and whether the account matches
+	// a type (persistence). Lets a "server has this account, model doesn't" finding
+	// be resolved: no cells means the model purged/never-recorded it.
+	if acct := os.Getenv("MODEL_TRACE_ACCOUNT"); acct != "" {
+		fmt.Printf("\ntrace account %q:\n", acct)
+		for _, l := range names {
+			ls := gs.Ledger(l)
+			cells := 0
+			for k, vp := range ls.Volumes() {
+				if k.Address == acct {
+					fmt.Printf("  %s  %s in=%s out=%s\n", l, k.Asset, vp.Input.Dec(), vp.Output.Dec())
+					cells++
+				}
+			}
+			if hits := postingHits(ls, acct); hits > 0 {
+				fmt.Printf("  %s  cells=%d committedPostings=%d\n", l, cells, hits)
+
+				var chart []string
+				for name, t := range ls.Types() {
+					chart = append(chart, fmt.Sprintf("%s=%s|%d", name, t.Pattern, t.Persistence))
+				}
+				sort.Strings(chart)
+				fmt.Printf("  %s  chart=[%s]\n", l, strings.Join(chart, ","))
+			}
+		}
+	}
+}
+
+// postingHits counts committed postings in ls touching acct on either side.
+func postingHits(ls oracle.LedgerState, acct string) int {
+	n := 0
+	for _, rec := range ls.Txs() {
+		for _, p := range rec.Postings() {
+			if p.GetSource() == acct || p.GetDestination() == acct {
+				n++
+			}
+		}
+	}
+
+	return n
 }
 
 // parse reads "[batch-dump] key=value ..." lines, extracting the ticket, commit

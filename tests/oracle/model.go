@@ -13,6 +13,7 @@ import (
 
 	"github.com/formancehq/ledger/v3/internal/domain"
 	"github.com/formancehq/ledger/v3/internal/domain/accounttype"
+	"github.com/formancehq/ledger/v3/internal/domain/indexes"
 	"github.com/formancehq/ledger/v3/internal/proto/commonpb"
 	"github.com/formancehq/ledger/v3/internal/proto/servicepb"
 )
@@ -85,6 +86,31 @@ type LedgerState struct {
 	// generator (which targets by reference) and reference-keyed metadata writes.
 	txByRef               map[string]int
 	transactionFieldTypes map[string]commonpb.MetadataType
+
+	// indexes tracks the read-store indexes the ledger has, keyed by canonical
+	// IndexID string. The value is the readiness flag: false = ambiguous (created,
+	// backfill may still be BUILDING on some replica — a not-ready error is
+	// tolerated), true = active (confirmed READY on all replicas — results are
+	// required). CreateIndex adds an ambiguous entry; the driver's readiness
+	// poller flips it to active; DropIndex removes it (instantaneous under the
+	// MinLogSequence pin).
+	indexes map[string]bool
+
+	// everAsset is the account-by-asset index projection: the set of
+	// (account, assetBase, precision) any committed, non-excluded posting has ever
+	// touched, on either side. This is the exact set the has-asset filter serves
+	// (see recordAssetTouches) — a monotonic history, NOT the current volume set:
+	// an account drained to zero and purged from the volume table stays here.
+	everAsset map[assetTouch]struct{}
+}
+
+// assetTouch identifies one account's historical touch of an (assetBase,
+// precision) pair — a member of the account-by-asset index the has-asset filter
+// reads. precision is uint32 to match AccountHasAssetCondition.
+type assetTouch struct {
+	address   string
+	base      string
+	precision uint32
 }
 
 func NewLedgerState() LedgerState {
@@ -98,6 +124,8 @@ func NewLedgerState() LedgerState {
 
 		txByRef:               map[string]int{},
 		transactionFieldTypes: map[string]commonpb.MetadataType{},
+		indexes:               map[string]bool{},
+		everAsset:             map[assetTouch]struct{}{},
 	}
 }
 
@@ -135,6 +163,12 @@ func (s LedgerState) clone() LedgerState {
 	transactionFieldTypes := make(map[string]commonpb.MetadataType, len(s.transactionFieldTypes))
 	maps.Copy(transactionFieldTypes, s.transactionFieldTypes)
 
+	indexes := make(map[string]bool, len(s.indexes))
+	maps.Copy(indexes, s.indexes)
+
+	everAsset := make(map[assetTouch]struct{}, len(s.everAsset))
+	maps.Copy(everAsset, s.everAsset)
+
 	return LedgerState{
 		types:                 types,
 		volumes:               volumes,
@@ -145,6 +179,8 @@ func (s LedgerState) clone() LedgerState {
 		txs:                   txs,
 		txByRef:               txByRef,
 		transactionFieldTypes: transactionFieldTypes,
+		indexes:               indexes,
+		everAsset:             everAsset,
 	}
 }
 
@@ -216,6 +252,31 @@ func (s LedgerState) Hash(h io.Writer) {
 	hashFieldTypes(h, "AF", s.accountFieldTypes)
 	hashFieldTypes(h, "LF", s.ledgerFieldTypes)
 	hashFieldTypes(h, "TF", s.transactionFieldTypes)
+
+	// Index set with readiness flag: two bases differing only in whether an index
+	// exists / is active predict different query outcomes, so they must not dedup.
+	ixkeys := make([]string, 0, len(s.indexes))
+	for k := range s.indexes {
+		ixkeys = append(ixkeys, k)
+	}
+	sort.Strings(ixkeys)
+	for _, k := range ixkeys {
+		_, _ = fmt.Fprintf(h, "IDX|%s|%t\n", k, s.indexes[k])
+	}
+
+	// Ever-touched account-by-asset set. Derivable from the tx log + chart, but
+	// two partial candidate-base foldings can reach an equal log/type hash with a
+	// different ever-touched set (types added at different points change per-order
+	// purge exclusion), so it is hashed to keep dedup from collapsing bases that
+	// predict different has-asset outcomes.
+	akeys := make([]string, 0, len(s.everAsset))
+	for k := range s.everAsset {
+		akeys = append(akeys, fmt.Sprintf("%s|%s|%d", k.address, k.base, k.precision))
+	}
+	sort.Strings(akeys)
+	for _, k := range akeys {
+		_, _ = fmt.Fprintf(h, "EA|%s\n", k)
+	}
 
 	// The log is already in id order; hash each tx's identity (id, reference,
 	// reverted, timestamp, revert relationships), postings, and metadata.
@@ -477,6 +538,10 @@ func LedgerOf(req *servicepb.Request) string {
 		return r.SetMetadataFieldType.GetLedger()
 	case *servicepb.Request_RemoveMetadataFieldType:
 		return r.RemoveMetadataFieldType.GetLedger()
+	case *servicepb.Request_CreateIndex:
+		return r.CreateIndex.GetLedger()
+	case *servicepb.Request_DropIndex:
+		return r.DropIndex.GetLedger()
 	default:
 		panic(fmt.Sprintf("LedgerOf: unmodeled request type %T", req.GetType()))
 	}
@@ -586,6 +651,12 @@ func (s *LedgerState) applyOne(req *servicepb.Request, touched map[VolumeKey]boo
 
 	case *servicepb.Request_RemoveMetadataFieldType:
 		return s.applyRemoveMetadataFieldType(r.RemoveMetadataFieldType)
+
+	case *servicepb.Request_CreateIndex:
+		return s.applyCreateIndex(r.CreateIndex)
+
+	case *servicepb.Request_DropIndex:
+		return s.applyDropIndex(r.DropIndex)
 
 	case *servicepb.Request_Apply:
 		switch a := r.Apply.GetAction().GetData().(type) {
@@ -821,7 +892,37 @@ func (s *LedgerState) applyPostings(postings []*commonpb.Posting, force bool, to
 		bump(dstKey, &amt, &zero)
 	}
 
+	s.recordAssetTouches(pcv)
+
 	return pcv, ""
+}
+
+// recordAssetTouches folds this order's touched cells into the ever-touched
+// account-by-asset set, mirroring the read-store index writer: a posting's source
+// and destination are recorded for their (assetBase, precision) unless excluded —
+// the account is TRANSIENT (never persisted, never indexed) or the cell is
+// EPHEMERAL and this order left it zero (purged in this order's log, so the index
+// skips it). pcv holds this order's post-commit volume per touched cell. A touch
+// is permanent once recorded (the index never deletes keys), so a later
+// drain-to-zero and purge does not un-record it — hence recording here, at the
+// touching order, not from the surviving volume table.
+func (s *LedgerState) recordAssetTouches(pcv map[VolumeKey]VolumePair) {
+	compiled := s.compiled()
+	for key, vp := range pcv {
+		if t := s.match(key.Address, compiled); t != nil {
+			switch t.Persistence {
+			case commonpb.AccountTypePersistence_ACCOUNT_TYPE_TRANSIENT:
+				continue
+			case commonpb.AccountTypePersistence_ACCOUNT_TYPE_EPHEMERAL:
+				if vp.Input.Cmp(&vp.Output) == 0 {
+					continue
+				}
+			}
+		}
+
+		base, prec := domain.ParseAssetPrecision(key.Asset)
+		s.everAsset[assetTouch{address: key.Address, base: base, precision: uint32(prec)}] = struct{}{}
+	}
 }
 
 // applyAddMetadata predicts a SaveMetadata, dispatching on the target. Metadata
@@ -940,6 +1041,28 @@ func (s *LedgerState) applyDeleteLedgerMetadata(req *servicepb.DeleteLedgerMetad
 	}
 
 	delete(s.ledgerMeta, key)
+
+	return OrderResult{OK: true}
+}
+
+// applyCreateIndex records a newly created index as ambiguous (readiness unknown
+// until the driver's poller confirms it READY). CreateIndex is idempotent on the
+// server (a duplicate on a present index is a no-op, no AlreadyExists), so an
+// existing entry keeps its current readiness flag.
+func (s *LedgerState) applyCreateIndex(req *servicepb.CreateIndexRequest) OrderResult {
+	canonical := indexes.Canonical(req.GetId())
+	if _, exists := s.indexes[canonical]; !exists {
+		s.indexes[canonical] = false // ambiguous: created, readiness not yet confirmed
+	}
+
+	return OrderResult{OK: true}
+}
+
+// applyDropIndex removes an index. Drop is instantaneous: once this order is in
+// the committed prefix, a MinLogSequence-pinned read is guaranteed to observe it
+// gone. Dropping an absent index is a harmless no-op.
+func (s *LedgerState) applyDropIndex(req *servicepb.DropIndexRequest) OrderResult {
+	delete(s.indexes, indexes.Canonical(req.GetId()))
 
 	return OrderResult{OK: true}
 }

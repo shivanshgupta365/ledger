@@ -80,26 +80,39 @@ func TestFilterInvalidForTarget(t *testing.T) {
 func TestMatchAccountFilter(t *testing.T) {
 	t.Parallel()
 
-	require.True(t, matchAccountFilter(nil, "anything")) // universe
+	// world → acc:1 in USD/2, so both hold a USD/2 (base "USD", precision 2)
+	// volume cell; neither holds EUR.
+	ls := buildLedger(t, oracletest.TxReq("world", "acc:1", "USD/2", 5))
 
-	require.True(t, matchAccountFilter(filterAddrPrefix("acc:"), "acc:1"))
-	require.False(t, matchAccountFilter(filterAddrPrefix("acc:"), "world"))
+	require.True(t, matchAccountFilter(ls, nil, "anything")) // universe
 
-	require.True(t, matchAccountFilter(filterAddrExact("acc:1"), "acc:1"))
-	require.False(t, matchAccountFilter(filterAddrExact("acc:1"), "acc:2"))
+	require.True(t, matchAccountFilter(ls, filterAddrPrefix("acc:"), "acc:1"))
+	require.False(t, matchAccountFilter(ls, filterAddrPrefix("acc:"), "world"))
 
-	require.True(t, matchAccountFilter(filterAnd(filterAddrPrefix("acc:"), filterAddrExact("acc:1")), "acc:1"))
-	require.False(t, matchAccountFilter(filterAnd(filterAddrPrefix("acc:"), filterAddrExact("acc:1")), "acc:2"))
+	require.True(t, matchAccountFilter(ls, filterAddrExact("acc:1"), "acc:1"))
+	require.False(t, matchAccountFilter(ls, filterAddrExact("acc:1"), "acc:2"))
 
-	require.True(t, matchAccountFilter(filterOr(filterAddrExact("acc:1"), filterAddrExact("acc:2")), "acc:2"))
-	require.False(t, matchAccountFilter(filterOr(filterAddrExact("acc:1"), filterAddrExact("acc:2")), "acc:3"))
+	require.True(t, matchAccountFilter(ls, filterAnd(filterAddrPrefix("acc:"), filterAddrExact("acc:1")), "acc:1"))
+	require.False(t, matchAccountFilter(ls, filterAnd(filterAddrPrefix("acc:"), filterAddrExact("acc:1")), "acc:2"))
 
-	require.True(t, matchAccountFilter(filterNot(filterAddrPrefix("acc:")), "world"))
-	require.False(t, matchAccountFilter(filterNot(filterAddrPrefix("acc:")), "acc:1"))
+	require.True(t, matchAccountFilter(ls, filterOr(filterAddrExact("acc:1"), filterAddrExact("acc:2")), "acc:2"))
+	require.False(t, matchAccountFilter(ls, filterOr(filterAddrExact("acc:1"), filterAddrExact("acc:2")), "acc:3"))
+
+	require.True(t, matchAccountFilter(ls, filterNot(filterAddrPrefix("acc:")), "world"))
+	require.False(t, matchAccountFilter(ls, filterNot(filterAddrPrefix("acc:")), "acc:1"))
+
+	// has-asset: matches an account with a volume cell in the (base, precision).
+	require.True(t, matchAccountFilter(ls, filterHasAsset("USD", 2), "acc:1"))
+	require.True(t, matchAccountFilter(ls, filterHasAsset("USD", 2), "world"))
+	require.False(t, matchAccountFilter(ls, filterHasAsset("EUR", 2), "acc:1"))
+	require.False(t, matchAccountFilter(ls, filterHasAsset("USD", 2), "acc:absent"))
+	// Composed with an index-free address leaf.
+	require.True(t, matchAccountFilter(ls, filterAnd(filterHasAsset("USD", 2), filterAddrPrefix("acc:")), "acc:1"))
+	require.False(t, matchAccountFilter(ls, filterAnd(filterHasAsset("USD", 2), filterAddrPrefix("acc:")), "world"))
 
 	// Empty And/Or match nothing, mirroring the compiler's empty iterator.
-	require.False(t, matchAccountFilter(filterAnd(), "acc:1"))
-	require.False(t, matchAccountFilter(filterOr(), "acc:1"))
+	require.False(t, matchAccountFilter(ls, filterAnd(), "acc:1"))
+	require.False(t, matchAccountFilter(ls, filterOr(), "acc:1"))
 }
 
 func TestMatchTxIDBounds(t *testing.T) {

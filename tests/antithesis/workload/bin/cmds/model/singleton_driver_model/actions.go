@@ -81,6 +81,15 @@ func generateBulk(g oracle.GlobalState, ledgers []string, receipts map[string]st
 		}
 	}
 
+	// An index create/drop is its own single-request bulk (single-ledger, since
+	// the index is ledger-scoped). Emitting it alone keeps the model's index
+	// lifecycle a clean sequence of committed CreateIndex/DropIndex orders.
+	if len(picks) == 1 && rollIndexOp() {
+		if req := generateIndexOp(g, picks[0]); req != nil {
+			return oracle.Bulk{Requests: []*servicepb.Request{req}}
+		}
+	}
+
 	size := bulkSize()
 	requests := make([]*servicepb.Request, 0, size)
 
@@ -282,9 +291,9 @@ func generateTransaction(ledger string, ls oracle.LedgerState) *servicepb.Reques
 	// Every transaction gets a unique reference so it is targetable by later
 	// transaction-metadata writes. ~half also carry metadata at creation.
 	payload := &servicepb.CreateTransactionPayload{
-		Postings:      postings,
-		Reference:     txRef(),
-		Force:         force,
+		Postings:  postings,
+		Reference: txRef(),
+		Force:     force,
 	}
 
 	if random.RandomChoice([]uint8{0, 1}) == 0 {
@@ -357,8 +366,8 @@ func duplicateReferenceTransaction(ledger string, ls oracle.LedgerState) *servic
 	}
 
 	return applyCreate(ledger, &servicepb.CreateTransactionPayload{
-		Postings:      []*commonpb.Posting{commonpb.NewPosting("world", poolAddress(), assets[0], big.NewInt(1))},
-		Reference:     ref,
+		Postings:  []*commonpb.Posting{commonpb.NewPosting("world", poolAddress(), assets[0], big.NewInt(1))},
+		Reference: ref,
 	})
 }
 
@@ -426,7 +435,7 @@ func txRequest(ledger, src, dest, asset string, amount *big.Int, force bool) *se
 							Postings: []*commonpb.Posting{
 								commonpb.NewPosting(src, dest, asset, amount),
 							},
-							Force:         force,
+							Force: force,
 						},
 					},
 				},
@@ -488,7 +497,7 @@ func generateDrainTransaction(ledger string, ls oracle.LedgerState) *servicepb.R
 							Postings: []*commonpb.Posting{
 								commonpb.NewPosting(srcKey.Address, "world", srcKey.Asset, balance.ToBig()),
 							},
-							Force:         true,
+							Force: true,
 						},
 					},
 				},

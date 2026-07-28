@@ -516,6 +516,8 @@ func (c *Checker) validateLedgerRead(maxTicket uint64, ledger string, serverType
 		"serverTypes": len(serverTypes),
 		"serverMeta":  renderMetaMap(serverMeta),
 		"modelMeta":   c.modelLedgerMetaDump(ledger),
+		"serverChart": renderChart(serverTypes),
+		"modelChart":  c.modelChartDump(ledger),
 	})
 }
 
