@@ -499,7 +499,20 @@ type txRecord struct {
 	revertedBy         uint64
 	revertedAt         *commonpb.Timestamp
 	revertsTransaction uint64
+	// indexedAddrs is the transaction's account→tx index membership: per
+	// posting-side account, which role rows (AddrIndexedSource /
+	// AddrIndexedDestination bits) the index builder writes for this
+	// transaction. Stamped at end of bulk (recordIndexedAddrs) — a posting side
+	// whose cell lands in the exclusion projection gets no row. The any-role
+	// index is the union of the two bits.
+	indexedAddrs map[string]uint8
 }
+
+// Bits of txRecord.indexedAddrs / IndexedAddrs.
+const (
+	AddrIndexedSource      uint8 = 1 << 0
+	AddrIndexedDestination uint8 = 1 << 1
+)
 
 // revertEffect is a committed revert's predicted effect: the original
 // transaction id (echoed as reverted_transaction_id) and the reversed postings.
@@ -614,6 +627,7 @@ func (g GlobalState) Apply(bulk Bulk) ApplyResult {
 		}
 
 		ls.recordAssetTouches(&base, cells)
+		ls.recordIndexedAddrs(&base, uint64(len(base.Txs()))+1)
 		ls.purgeZeroBalance(cells)
 	}
 
@@ -921,31 +935,83 @@ func (s *LedgerState) applyPostings(postings []*commonpb.Posting, force bool, to
 func (s *LedgerState) recordAssetTouches(base *LedgerState, touched map[VolumeKey]bool) {
 	compiled := s.compiled()
 	for key := range touched {
-		vp, ok := s.volumes[key]
-		if !ok {
+		if s.cellExcluded(base, key, compiled) {
 			continue
-		}
-
-		if t := s.match(key.Address, compiled); t != nil {
-			switch t.Persistence {
-			case commonpb.AccountTypePersistence_ACCOUNT_TYPE_TRANSIENT:
-				bv := base.vol(key)
-				if bv.Input.IsZero() && bv.Output.IsZero() {
-					continue
-				}
-
-				if vp.Input.Cmp(&vp.Output) == 0 {
-					continue
-				}
-			case commonpb.AccountTypePersistence_ACCOUNT_TYPE_EPHEMERAL:
-				if vp.Input.Cmp(&vp.Output) == 0 {
-					continue
-				}
-			}
 		}
 
 		assetBase, prec := domain.ParseAssetPrecision(key.Asset)
 		s.everAsset[assetTouch{address: key.Address, base: assetBase, precision: uint32(prec)}] = struct{}{}
+	}
+}
+
+// cellExcluded is the model's copy of the per-cell verdict behind the server's
+// exclusion projection (LedgerLog.PurgedVolumes ∪ AppliedProposal
+// .TransientVolumes), evaluated at END of bulk on the final pre-purge volumes
+// with the end-of-bulk chart:
+//
+//   - TRANSIENT-matched, all-zero pre-bulk value: steady-state transient —
+//     carried on TransientVolumes, excluded.
+//   - TRANSIENT-matched, non-zero pre-bulk value (grandfathered) or
+//     EPHEMERAL-matched: excluded when the bulk leaves the cell at zero
+//     balance (purged), kept otherwise.
+//   - NORMAL or unmatched: never excluded.
+//
+// base is the pre-bulk state (the preloaded Old the server classifies on). Must
+// run before purgeZeroBalance — the verdict reads the pre-purge balance. A cell
+// the bulk never wrote (absent from volumes) is vacuously excluded.
+func (s *LedgerState) cellExcluded(base *LedgerState, key VolumeKey, compiled []accounttype.CompiledType) bool {
+	vp, ok := s.volumes[key]
+	if !ok {
+		return true
+	}
+
+	t := s.match(key.Address, compiled)
+	if t == nil {
+		return false
+	}
+
+	switch t.Persistence {
+	case commonpb.AccountTypePersistence_ACCOUNT_TYPE_TRANSIENT:
+		bv := base.vol(key)
+		if bv.Input.IsZero() && bv.Output.IsZero() {
+			return true
+		}
+
+		return vp.Input.Cmp(&vp.Output) == 0
+	case commonpb.AccountTypePersistence_ACCOUNT_TYPE_EPHEMERAL:
+		return vp.Input.Cmp(&vp.Output) == 0
+	default:
+		return false
+	}
+}
+
+// recordIndexedAddrs stamps every transaction this bulk appended (ids in
+// (firstNew-1, len(txs)]) with its account→tx index membership: for each
+// posting side, the (account, role) pair is indexed unless the posting's cell
+// is in the end-of-bulk exclusion projection — mirroring the index builder's
+// per-posting sourceExcluded/destinationExcluded skip. The any-role index is
+// the union of the two sides, so only source/destination bits are stored.
+// Replacing the records is safe: they were allocated by this Apply, so no
+// older clone aliases them. Must run before purgeZeroBalance, like
+// recordAssetTouches.
+func (s *LedgerState) recordIndexedAddrs(base *LedgerState, firstNew uint64) {
+	compiled := s.compiled()
+
+	for id := firstNew; id <= uint64(len(s.txs)); id++ {
+		rec := *s.txs[id-1]
+		rec.indexedAddrs = map[string]uint8{}
+
+		for _, p := range rec.postings {
+			if !s.cellExcluded(base, VolumeKey{Address: p.GetSource(), Asset: p.GetAsset()}, compiled) {
+				rec.indexedAddrs[p.GetSource()] |= AddrIndexedSource
+			}
+
+			if !s.cellExcluded(base, VolumeKey{Address: p.GetDestination(), Asset: p.GetAsset()}, compiled) {
+				rec.indexedAddrs[p.GetDestination()] |= AddrIndexedDestination
+			}
+		}
+
+		s.txs[id-1] = &rec
 	}
 }
 

@@ -482,7 +482,7 @@ func transactionWindowRows(ls oracle.LedgerState, filter *commonpb.QueryFilter, 
 
 	var rows []txWindowRow
 	for _, rec := range ls.Txs() {
-		match, known := matchTxFilter(filter, rec)
+		match, known := matchTxFilter(ls, filter, rec)
 		if known && !match {
 			continue
 		}
@@ -632,6 +632,7 @@ type txRecordView interface {
 	RevertedBy() uint64
 	RevertedAt() *commonpb.Timestamp
 	RevertsTransaction() uint64
+	IndexedAddrs() map[string]uint8
 }
 
 // txRecordMatches reports whether the model record rec is consistent with the
@@ -793,17 +794,49 @@ func genTransactionFilter(seeds txFilterSeeds) *commonpb.QueryFilter {
 // special casing: the window evaluator handles any boolean of these.
 func genTransactionFilterIndexed(seeds txFilterSeeds, depth int) *commonpb.QueryFilter {
 	if depth >= maxQueryGenDepth || random.RandomChoice([]uint8{0, 1}) == 0 {
-		switch random.RandomChoice([]uint8{0, 1, 2, 3}) {
+		switch random.RandomChoice([]uint8{0, 1, 2, 3, 4}) {
 		case 0:
 			return filterReference(seedReference(seeds))
 		case 1, 2:
 			return genDateLeaf(seeds)
+		case 3:
+			return genTxAddressLeaf()
 		default:
 			return genTransactionFilterFree(depth)
 		}
 	}
 
 	return genBoolean(depth, func(d int) *commonpb.QueryFilter { return genTransactionFilterIndexed(seeds, d) })
+}
+
+// genTxAddressLeaf rolls an address leaf for the transactions target: a pool
+// address (exact or cut to a prefix), or an unmatchable prefix, under a random
+// role. Pool addresses re-target heavily, so exact and prefix variants both
+// straddle live account→tx rows.
+func genTxAddressLeaf() *commonpb.QueryFilter {
+	roles := []commonpb.AddressRole{
+		commonpb.AddressRole_ADDRESS_ROLE_ANY,
+		commonpb.AddressRole_ADDRESS_ROLE_SOURCE,
+		commonpb.AddressRole_ADDRESS_ROLE_DESTINATION,
+	}
+	role := roles[int(random.RandomChoice([]uint8{0, 1, 2}))]
+
+	addr := poolAddress()
+	switch random.RandomChoice([]uint8{0, 1, 2, 3}) {
+	case 0:
+		return filterAddrExactRole(addr, role)
+	case 1:
+		return filterAddrExactRole("world", role)
+	case 2:
+		// The "t-N:" one-type prefix; ":"-terminated so it cannot over-match.
+		return filterAddrPrefixRole(addr[:strings.IndexByte(addr, ':')+1], role)
+	default:
+		if oneIn(8) {
+			return filterAddrPrefixRole("absent:", role)
+		}
+
+		return filterAddrPrefixRole("t-", role)
+	}
 }
 
 // seedReference picks a committed reference most of the time, a miss otherwise
@@ -896,14 +929,24 @@ func genBoolean(depth int, gen func(int) *commonpb.QueryFilter) *commonpb.QueryF
 // --- Filter constructors ------------------------------------------------
 
 func filterAddrPrefix(prefix string) *commonpb.QueryFilter {
+	return filterAddrPrefixRole(prefix, commonpb.AddressRole_ADDRESS_ROLE_ANY)
+}
+
+func filterAddrPrefixRole(prefix string, role commonpb.AddressRole) *commonpb.QueryFilter {
 	return &commonpb.QueryFilter{Filter: &commonpb.QueryFilter_Address{Address: &commonpb.AddressMatch{
 		Match: &commonpb.AddressMatch_HardcodedPrefix{HardcodedPrefix: prefix},
+		Role:  role,
 	}}}
 }
 
 func filterAddrExact(addr string) *commonpb.QueryFilter {
+	return filterAddrExactRole(addr, commonpb.AddressRole_ADDRESS_ROLE_ANY)
+}
+
+func filterAddrExactRole(addr string, role commonpb.AddressRole) *commonpb.QueryFilter {
 	return &commonpb.QueryFilter{Filter: &commonpb.QueryFilter_Address{Address: &commonpb.AddressMatch{
 		Match: &commonpb.AddressMatch_HardcodedExact{HardcodedExact: addr},
+		Role:  role,
 	}}}
 }
 
@@ -1010,6 +1053,8 @@ func neededIndexCanonicals(f *commonpb.QueryFilter, out map[string]struct{}) {
 		neededIndexCanonicals(x.Not.GetFilter(), out)
 	case *commonpb.QueryFilter_Reference:
 		out[txBuiltinCanonical(commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_REFERENCE)] = struct{}{}
+	case *commonpb.QueryFilter_Address:
+		out[txBuiltinCanonical(addressRoleBuiltin(x.Address.GetRole()))] = struct{}{}
 	case *commonpb.QueryFilter_BuiltinUint:
 		if x.BuiltinUint.GetField() != commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_ID {
 			out[txBuiltinCanonical(x.BuiltinUint.GetField())] = struct{}{}
@@ -1017,8 +1062,8 @@ func neededIndexCanonicals(f *commonpb.QueryFilter, out map[string]struct{}) {
 	case *commonpb.QueryFilter_Reverted:
 		// index-free
 	default:
-		// Field, address-on-transactions, log conditions: index-backed leaves
-		// whose index the workload never creates.
+		// Field, log conditions: index-backed leaves whose index the workload
+		// never creates.
 		out[neverBuiltIndexCanonical] = struct{}{}
 	}
 }
@@ -1151,7 +1196,7 @@ func matchAccountFilter(ls oracle.LedgerState, f *commonpb.QueryFilter, addr str
 // of a bulk still in flight — see oracle.LearnTxStamps). Booleans propagate
 // unknowns Kleene-style: a decided AND/OR short-circuits, an undecided one
 // stays unknown. Window construction turns unknown rows into optional ones.
-func matchTxFilter(f *commonpb.QueryFilter, rec txRecordView) (match, known bool) {
+func matchTxFilter(ls oracle.LedgerState, f *commonpb.QueryFilter, rec txRecordView) (match, known bool) {
 	if f == nil {
 		return true, true
 	}
@@ -1163,12 +1208,14 @@ func matchTxFilter(f *commonpb.QueryFilter, rec txRecordView) (match, known bool
 		// Exact match on the null-terminated txref key; empty references are
 		// never written to the index, so they can never match.
 		return rec.Reference() != "" && rec.Reference() == x.Reference.GetCond().GetHardcoded(), true
+	case *commonpb.QueryFilter_Address:
+		return matchTxAddress(ls, x.Address, rec), true
 	case *commonpb.QueryFilter_BuiltinUint:
 		return matchTxBuiltinUint(x.BuiltinUint, rec)
 	case *commonpb.QueryFilter_And:
 		match, known = true, true
 		for _, child := range x.And.GetFilters() {
-			m, k := matchTxFilter(child, rec)
+			m, k := matchTxFilter(ls, child, rec)
 			if k && !m {
 				return false, true
 			}
@@ -1179,7 +1226,7 @@ func matchTxFilter(f *commonpb.QueryFilter, rec txRecordView) (match, known bool
 	case *commonpb.QueryFilter_Or:
 		match, known = false, true
 		for _, child := range x.Or.GetFilters() {
-			m, k := matchTxFilter(child, rec)
+			m, k := matchTxFilter(ls, child, rec)
 			if k && m {
 				return true, true
 			}
@@ -1188,12 +1235,56 @@ func matchTxFilter(f *commonpb.QueryFilter, rec txRecordView) (match, known bool
 
 		return match, known
 	case *commonpb.QueryFilter_Not:
-		m, k := matchTxFilter(x.Not.GetFilter(), rec)
+		m, k := matchTxFilter(ls, x.Not.GetFilter(), rec)
 
 		return !m, k
 	default:
 		return false, true
 	}
+}
+
+// matchTxAddress evaluates an address leaf on the TRANSACTIONS target: the
+// transaction matches iff some account in its account→tx index membership
+// (IndexedAddrs, role-filtered) matches the prefix/exact pattern AND is still
+// in the merged V+M account universe — the server resolves matching accounts
+// through the attributes zone (pebbleAccountExists / the account prefix
+// iterator), so a purged account with no metadata stops reaching its
+// transactions even though the index rows remain.
+func matchTxAddress(ls oracle.LedgerState, am *commonpb.AddressMatch, rec txRecordView) bool {
+	var roleMask uint8
+	switch am.GetRole() {
+	case commonpb.AddressRole_ADDRESS_ROLE_SOURCE:
+		roleMask = oracle.AddrIndexedSource
+	case commonpb.AddressRole_ADDRESS_ROLE_DESTINATION:
+		roleMask = oracle.AddrIndexedDestination
+	default:
+		roleMask = oracle.AddrIndexedSource | oracle.AddrIndexedDestination
+	}
+
+	for addr, bits := range rec.IndexedAddrs() {
+		if bits&roleMask == 0 {
+			continue
+		}
+
+		switch m := am.GetMatch().(type) {
+		case *commonpb.AddressMatch_HardcodedPrefix:
+			if !strings.HasPrefix(addr, m.HardcodedPrefix) {
+				continue
+			}
+		case *commonpb.AddressMatch_HardcodedExact:
+			if addr != m.HardcodedExact {
+				continue
+			}
+		default:
+			continue // param matches are not generated
+		}
+
+		if ls.HasAccount(addr) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // matchTxBuiltinUint evaluates a transaction builtin-uint leaf. The date
@@ -1311,11 +1402,19 @@ func describeFilter(f *commonpb.QueryFilter) string {
 
 	switch x := f.GetFilter().(type) {
 	case *commonpb.QueryFilter_Address:
+		role := ""
+		switch x.Address.GetRole() {
+		case commonpb.AddressRole_ADDRESS_ROLE_SOURCE:
+			role = "/src"
+		case commonpb.AddressRole_ADDRESS_ROLE_DESTINATION:
+			role = "/dst"
+		}
+
 		switch m := x.Address.GetMatch().(type) {
 		case *commonpb.AddressMatch_HardcodedPrefix:
-			return "addr^" + m.HardcodedPrefix
+			return "addr^" + m.HardcodedPrefix + role
 		case *commonpb.AddressMatch_HardcodedExact:
-			return "addr=" + m.HardcodedExact
+			return "addr=" + m.HardcodedExact + role
 		}
 
 		return "addr?"

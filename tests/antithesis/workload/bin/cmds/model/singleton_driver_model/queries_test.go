@@ -150,7 +150,7 @@ func TestMatchTxFilter(t *testing.T) {
 
 	// These leaves never read a server stamp, so every verdict must be known.
 	matchKnown := func(f *commonpb.QueryFilter, rec txRecordView) bool {
-		m, known := matchTxFilter(f, rec)
+		m, known := matchTxFilter(ls, f, rec)
 		require.True(t, known)
 
 		return m
@@ -290,7 +290,7 @@ func TestMatchTxFilter_TxBuiltinLeaves(t *testing.T) {
 	txs := gs.Ledger("L").Txs()
 
 	known := func(f *commonpb.QueryFilter, rec txRecordView) bool {
-		m, k := matchTxFilter(f, rec)
+		m, k := matchTxFilter(gs.Ledger("L"), f, rec)
 		require.True(t, k)
 
 		return m
@@ -324,21 +324,21 @@ func TestMatchTxFilter_UnknownStamps(t *testing.T) {
 
 	tsLeaf := filterDateRange(commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_TIMESTAMP, 1, 2)
 
-	_, k := matchTxFilter(tsLeaf, rec)
+	_, k := matchTxFilter(ls, tsLeaf, rec)
 	require.False(t, k)
 
-	_, k = matchTxFilter(filterNot(tsLeaf), rec)
+	_, k = matchTxFilter(ls, filterNot(tsLeaf), rec)
 	require.False(t, k)
 
-	m, k := matchTxFilter(filterAnd(filterReverted(true), tsLeaf), rec)
+	m, k := matchTxFilter(ls, filterAnd(filterReverted(true), tsLeaf), rec)
 	require.True(t, k, "AND decided by the known-false reverted leaf")
 	require.False(t, m)
 
-	m, k = matchTxFilter(filterOr(filterReverted(false), tsLeaf), rec)
+	m, k = matchTxFilter(ls, filterOr(filterReverted(false), tsLeaf), rec)
 	require.True(t, k, "OR decided by the known-true reverted leaf")
 	require.True(t, m)
 
-	_, k = matchTxFilter(filterOr(filterReverted(true), tsLeaf), rec)
+	_, k = matchTxFilter(ls, filterOr(filterReverted(true), tsLeaf), rec)
 	require.False(t, k, "OR undecided when the known leaf misses")
 }
 
@@ -377,4 +377,96 @@ func TestTxWindowMatches_OptionalRows(t *testing.T) {
 	require.False(t, txWindowMatches(ls, filter, 0, 10, true, page(2, 3)), "required first row missing")
 	require.True(t, txWindowMatches(ls, filter, 1, 10, true, page(2, 3)), "cursor drops tx 1; optional 2 present")
 	require.True(t, txWindowMatches(ls, filter, 1, 10, true, page(3)), "cursor drops tx 1; optional 2 absent")
+}
+
+// --- Phase 4: address-on-transactions ---------------------------------------
+
+func TestMatchTxAddress_RolesAndExclusions(t *testing.T) {
+	t.Parallel()
+
+	// Bulk: an ephemeral wash on e:1 (its cell is excluded at end of bulk) and a
+	// normal funding of a:1. tx 1 is the wash, tx 2 the funding.
+	gs := buildGlobal(t,
+		oracletest.AddTypeReqP("e", commonpb.AccountTypePersistence_ACCOUNT_TYPE_EPHEMERAL),
+		oracletest.AddTypeReqP("a", commonpb.AccountTypePersistence_ACCOUNT_TYPE_NORMAL),
+		oracletest.TxReqL("L", "world", "e:1", "USD", 5),
+		oracletest.TxReqL("L", "e:1", "world", "USD", 5),
+		oracletest.TxReqL("L", "world", "a:1", "USD", 7),
+	)
+	ls := gs.Ledger("L")
+	txs := ls.Txs()
+	require.Len(t, txs, 3)
+
+	anyRole := commonpb.AddressRole_ADDRESS_ROLE_ANY
+	src := commonpb.AddressRole_ADDRESS_ROLE_SOURCE
+	dst := commonpb.AddressRole_ADDRESS_ROLE_DESTINATION
+
+	addr := func(f *commonpb.QueryFilter) *commonpb.AddressMatch {
+		return f.GetFilter().(*commonpb.QueryFilter_Address).Address
+	}
+
+	// The excluded ephemeral cell strips e:1 membership from both wash txs.
+	require.False(t, matchTxAddress(ls, addr(filterAddrExactRole("e:1", anyRole)), txs[0]))
+	require.False(t, matchTxAddress(ls, addr(filterAddrExactRole("e:1", anyRole)), txs[1]))
+
+	// world's side of the wash is a kept NORMAL cell — still indexed.
+	require.True(t, matchTxAddress(ls, addr(filterAddrExactRole("world", src)), txs[0]))
+	require.True(t, matchTxAddress(ls, addr(filterAddrExactRole("world", dst)), txs[1]))
+
+	// Role bits on the funding tx: world is the source, a:1 the destination.
+	require.True(t, matchTxAddress(ls, addr(filterAddrExactRole("a:1", anyRole)), txs[2]))
+	require.True(t, matchTxAddress(ls, addr(filterAddrExactRole("a:1", dst)), txs[2]))
+	require.False(t, matchTxAddress(ls, addr(filterAddrExactRole("a:1", src)), txs[2]))
+	require.True(t, matchTxAddress(ls, addr(filterAddrPrefixRole("a:", dst)), txs[2]))
+	require.False(t, matchTxAddress(ls, addr(filterAddrPrefixRole("b:", anyRole)), txs[2]))
+}
+
+func TestMatchTxAddress_UniverseDrop(t *testing.T) {
+	t.Parallel()
+
+	// Bulk 1 funds ephemeral e:1 (non-zero at end of bulk → kept and indexed).
+	res1 := oracle.NewGlobalState().Apply(oracle.Bulk{Requests: []*servicepb.Request{
+		oracletest.AddTypeReqP("e", commonpb.AccountTypePersistence_ACCOUNT_TYPE_EPHEMERAL),
+		oracletest.TxReqL("L", "world", "e:1", "USD", 5),
+	}})
+	require.True(t, res1.OK)
+
+	ls1 := res1.State.Ledger("L")
+	exact := func(a string) *commonpb.AddressMatch {
+		return filterAddrExactRole(a, commonpb.AddressRole_ADDRESS_ROLE_ANY).GetFilter().(*commonpb.QueryFilter_Address).Address
+	}
+	require.True(t, matchTxAddress(ls1, exact("e:1"), ls1.Txs()[0]))
+
+	// Bulk 2 drains it to zero: the cell is purged, dropping e:1 from the V+M
+	// universe — tx 1 keeps its index membership but stops being reachable
+	// through an address match, exactly like the server's attributes-zone
+	// account resolution.
+	res2 := res1.State.Apply(oracle.Bulk{Requests: []*servicepb.Request{
+		oracletest.TxReqL("L", "e:1", "world", "USD", 5),
+	}})
+	require.True(t, res2.OK)
+
+	ls2 := res2.State.Ledger("L")
+	rec := ls2.Txs()[0]
+	require.NotZero(t, rec.IndexedAddrs()["e:1"], "membership itself is monotone")
+	require.False(t, ls2.HasAccount("e:1"))
+	require.False(t, matchTxAddress(ls2, exact("e:1"), rec))
+}
+
+func TestNeededIndexCanonicals_AddressRoles(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		role    commonpb.AddressRole
+		builtin commonpb.TransactionBuiltinIndex
+	}{
+		{commonpb.AddressRole_ADDRESS_ROLE_ANY, commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_ADDRESS},
+		{commonpb.AddressRole_ADDRESS_ROLE_SOURCE, commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_SOURCE_ADDRESS},
+		{commonpb.AddressRole_ADDRESS_ROLE_DESTINATION, commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_DESTINATION_ADDRESS},
+	} {
+		needed := map[string]struct{}{}
+		neededIndexCanonicals(filterAddrPrefixRole("t-", tc.role), needed)
+		require.Len(t, needed, 1)
+		require.Contains(t, needed, txBuiltinCanonical(tc.builtin))
+	}
 }

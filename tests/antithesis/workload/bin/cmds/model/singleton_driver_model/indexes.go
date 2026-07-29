@@ -48,13 +48,29 @@ func assetIndexID() *commonpb.IndexID {
 var assetIndexCanonical = indexes.Canonical(assetIndexID())
 
 // workloadTxBuiltins are the transaction builtin indexes the generator churns:
-// the index-backed leaves of the transactions filter grammar (reference and the
-// three date fields).
+// the index-backed leaves of the transactions filter grammar (reference, the
+// three date fields, and the three address-role account→tx mappings).
 var workloadTxBuiltins = []commonpb.TransactionBuiltinIndex{
 	commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_REFERENCE,
 	commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_TIMESTAMP,
 	commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_INSERTED_AT,
 	commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_REVERTED_AT,
+	commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_ADDRESS,
+	commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_SOURCE_ADDRESS,
+	commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_DESTINATION_ADDRESS,
+}
+
+// addressRoleBuiltin maps an address role to the tx builtin index serving it —
+// the model's copy of the compiler's txAddressIndexID.
+func addressRoleBuiltin(role commonpb.AddressRole) commonpb.TransactionBuiltinIndex {
+	switch role {
+	case commonpb.AddressRole_ADDRESS_ROLE_SOURCE:
+		return commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_SOURCE_ADDRESS
+	case commonpb.AddressRole_ADDRESS_ROLE_DESTINATION:
+		return commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_DESTINATION_ADDRESS
+	default:
+		return commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_ADDRESS
+	}
 }
 
 // txBuiltinCanonical returns the canonical IndexID string of a tx builtin — the

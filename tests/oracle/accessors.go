@@ -44,6 +44,31 @@ func (t *txRecord) RevertedBy() uint64                           { return t.reve
 func (t *txRecord) RevertedAt() *commonpb.Timestamp              { return t.revertedAt }
 func (t *txRecord) RevertsTransaction() uint64                   { return t.revertsTransaction }
 
+// IndexedAddrs is the transaction's account→tx index membership, keyed by
+// account with AddrIndexedSource/AddrIndexedDestination bits — see
+// txRecord.indexedAddrs. Read-only, like the other map accessors.
+func (t *txRecord) IndexedAddrs() map[string]uint8 { return t.indexedAddrs }
+
+// HasAccount reports whether the account currently holds a volume cell or a
+// metadata entry — membership in the merged V+M attributes universe the
+// server's address matching scans (pebbleAccountExists / the account prefix
+// iterator). A purged account with no metadata is NOT in the universe even
+// when older index rows still reference it.
+func (s LedgerState) HasAccount(addr string) bool {
+	for k := range s.volumes {
+		if k.Address == addr {
+			return true
+		}
+	}
+	for k := range s.metadata {
+		if k.Address == addr {
+			return true
+		}
+	}
+
+	return false
+}
+
 // Indexes returns the ledger's index set keyed by canonical IndexID (value is
 // the active flag: true active, false ambiguous). Read-only, like the other map
 // accessors — mutate index state through SetIndexActive / SetIndexAmbiguous.
