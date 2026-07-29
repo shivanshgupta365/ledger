@@ -484,8 +484,12 @@ type txRecord struct {
 	// timestamp is the user-supplied CreateTransaction timestamp, stored verbatim
 	// and echoed on reads. nil when the client sent none — the server then stamps
 	// its own command date, which the model cannot predict, so reads skip the
-	// timestamp check for such records.
+	// timestamp check for such records. The checker may later fill a nil via
+	// LearnTxStamps with the value the commit response carried.
 	timestamp *commonpb.Timestamp
+	// insertedAt is always server-stamped (never client-supplied), so it starts
+	// nil and is known only once the checker learns it from the commit response.
+	insertedAt *commonpb.Timestamp
 	// Revert relationships, mirroring the server's Transaction fields: on a
 	// reverted original, revertedBy carries the compensating transaction's id
 	// and revertedAt its timestamp (nil when the compensating transaction is

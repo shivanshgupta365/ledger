@@ -160,8 +160,9 @@ func runAccountQuery(ctx context.Context, client servicepb.BucketServiceClient, 
 // One-in-six queries carry an index-backed filter to exercise the NotFound path.
 func runTransactionQuery(ctx context.Context, client servicepb.BucketServiceClient, c *Checker) {
 	ledger := random.RandomChoice(c.ledgerNames)
-	filter := genTransactionFilter()
-	needsIndex := filterNeedsIndex(filter, commonpb.QueryTarget_QUERY_TARGET_TRANSACTIONS)
+	filter := genTransactionFilter(c.sampleTxFilterSeeds(ledger))
+	needed := map[string]struct{}{}
+	neededIndexCanonicals(filter, needed)
 	invalidTarget := filterInvalidForTarget(filter, commonpb.QueryTarget_QUERY_TARGET_TRANSACTIONS)
 	pageSize := queryPageSize()
 	reverse := random.RandomChoice([]uint8{0, 1}) == 1
@@ -210,7 +211,8 @@ func runTransactionQuery(ctx context.Context, client servicepb.BucketServiceClie
 		if handleInvalidTargetError(invalidTarget, "transaction", ledger, filter, err) {
 			return
 		}
-		if handleIndexGatedError(needsIndex, "transaction", ledger, filter, err) {
+		if len(needed) > 0 {
+			c.validateIndexedTransactionQuery(maxTicket, ledger, filter, needed, afterID, pageSize, reverse, nil, err)
 			return
 		}
 
@@ -233,13 +235,8 @@ func runTransactionQuery(ctx context.Context, client servicepb.BucketServiceClie
 		return
 	}
 
-	if needsIndex {
-		assert.Unreachable("singleton_driver_model: index-gated transaction query returned results", internal.Details{
-			"ledger": ledger,
-			"filter": describeFilter(filter),
-			"rows":   len(txs),
-		})
-
+	if len(needed) > 0 {
+		c.validateIndexedTransactionQuery(maxTicket, ledger, filter, needed, afterID, pageSize, reverse, txs, nil)
 		return
 	}
 
@@ -375,20 +372,7 @@ func (c *Checker) modelAccountWindow(ledger string, filter *commonpb.QueryFilter
 // id (see txRecordMatches) on that same base.
 func (c *Checker) validateTransactionQuery(maxTicket uint64, ledger string, filter *commonpb.QueryFilter, afterID uint64, pageSize int, reverse bool, serverTxs []*commonpb.Transaction) {
 	if c.matchesModel(maxTicket, "TXQUERY", func(base oracle.GlobalState) bool {
-		ls := base.Ledger(ledger)
-		txs := ls.Txs()
-		want := transactionWindow(ls, filter, afterID, pageSize, reverse)
-		if len(want) != len(serverTxs) {
-			return false
-		}
-
-		for i, id := range want {
-			if serverTxs[i].GetId() != id || !txRecordMatches(txs[id-1], serverTxs[i]) {
-				return false
-			}
-		}
-
-		return true
+		return txWindowMatches(base.Ledger(ledger), filter, afterID, pageSize, reverse, serverTxs)
 	}) {
 		return
 	}
@@ -455,40 +439,16 @@ func accountWindow(ls oracle.LedgerState, filter *commonpb.QueryFilter, cursor s
 	return window
 }
 
-// transactionWindow is the model's prediction of a ListTransactions page: the
-// ledger's transactions matching filter, ordered, with the exclusive afterID
-// cursor applied and capped at pageSize.
-//
-// The transactions endpoint INVERTS the API reverse flag (controller
-// ListTransactionsFrom passes reverse=!reverse to listEntities): reverse=false
-// yields newest-first (descending id), reverse=true yields oldest-first
-// (ascending). This is the opposite of accounts, which follow reverse literally.
-// Descending pages drop ids >= afterID (older-than cursor); ascending pages drop
-// ids <= afterID (newer-than cursor) — mirroring PaginateReverse / PaginateForward.
+// transactionWindow is the required-row window — the ids a page must show when
+// every filter verdict is known — capped at pageSize. Used for a finding's
+// diagnostics; validation goes through txWindowMatches, which also handles
+// optional rows.
 func transactionWindow(ls oracle.LedgerState, filter *commonpb.QueryFilter, afterID uint64, pageSize int, reverse bool) []uint64 {
-	descending := !reverse
-
 	var window []uint64
-	for _, rec := range ls.Txs() {
-		if matchTxFilter(filter, rec) {
-			window = append(window, rec.Id())
+	for _, row := range transactionWindowRows(ls, filter, afterID, reverse) {
+		if row.required {
+			window = append(window, row.id)
 		}
-	}
-
-	if descending {
-		reverseUint64(window)
-	}
-
-	if afterID != 0 {
-		kept := window[:0]
-		for _, id := range window {
-			if descending && id >= afterID || !descending && id <= afterID {
-				continue
-			}
-
-			kept = append(kept, id)
-		}
-		window = kept
 	}
 
 	if len(window) > pageSize {
@@ -496,6 +456,96 @@ func transactionWindow(ls oracle.LedgerState, filter *commonpb.QueryFilter, afte
 	}
 
 	return window
+}
+
+// txWindowRow is one ordered candidate row of a predicted transaction page:
+// required rows must appear in the server page, optional ones (a filter verdict
+// hinging on a not-yet-learned server stamp) may.
+type txWindowRow struct {
+	id       uint64
+	required bool
+}
+
+// transactionWindowRows is the ordered, cursor-filtered, UNTRUNCATED row
+// sequence a ListTransactions page draws from. Truncation is the matcher's job
+// (txWindowMatches) — optional rows may or may not consume page slots, so a
+// fixed prefix cut would be wrong.
+//
+// The transactions endpoint INVERTS the API reverse flag (controller
+// ListTransactionsFrom passes reverse=!reverse to listEntities): reverse=false
+// yields newest-first (descending id), reverse=true yields oldest-first
+// (ascending). This is the opposite of accounts, which follow reverse literally.
+// Descending pages drop ids >= afterID (older-than cursor); ascending pages drop
+// ids <= afterID (newer-than cursor) — mirroring PaginateReverse / PaginateForward.
+func transactionWindowRows(ls oracle.LedgerState, filter *commonpb.QueryFilter, afterID uint64, reverse bool) []txWindowRow {
+	descending := !reverse
+
+	var rows []txWindowRow
+	for _, rec := range ls.Txs() {
+		match, known := matchTxFilter(filter, rec)
+		if known && !match {
+			continue
+		}
+
+		rows = append(rows, txWindowRow{id: rec.Id(), required: known})
+	}
+
+	if descending {
+		for i, j := 0, len(rows)-1; i < j; i, j = i+1, j-1 {
+			rows[i], rows[j] = rows[j], rows[i]
+		}
+	}
+
+	if afterID != 0 {
+		kept := rows[:0]
+		for _, row := range rows {
+			if descending && row.id >= afterID || !descending && row.id <= afterID {
+				continue
+			}
+
+			kept = append(kept, row)
+		}
+		rows = kept
+	}
+
+	return rows
+}
+
+// txWindowMatches reports whether the server page is exactly a legal window
+// over the candidate's row sequence: required rows appear in order (each
+// content-matching its model record), optional rows may, nothing else does, and
+// a required row may only be missing past a full (truncated) page.
+func txWindowMatches(ls oracle.LedgerState, filter *commonpb.QueryFilter, afterID uint64, pageSize int, reverse bool, serverTxs []*commonpb.Transaction) bool {
+	if len(serverTxs) > pageSize {
+		return false
+	}
+
+	txs := ls.Txs()
+	j := 0
+
+	for _, row := range transactionWindowRows(ls, filter, afterID, reverse) {
+		if j == len(serverTxs) {
+			if len(serverTxs) == pageSize {
+				return true // full page — the remaining rows were truncated
+			}
+			if row.required {
+				return false // page had room, yet a required row is missing
+			}
+
+			continue
+		}
+
+		if serverTxs[j].GetId() == row.id {
+			if !txRecordMatches(txs[row.id-1], serverTxs[j]) {
+				return false
+			}
+			j++
+		} else if row.required {
+			return false
+		}
+	}
+
+	return j == len(serverTxs)
 }
 
 // accountUniverse returns ls's account addresses — every address carrying a
@@ -578,6 +628,7 @@ type txRecordView interface {
 	Metadata() map[string]*commonpb.MetadataValue
 	Reverted() bool
 	Timestamp() *commonpb.Timestamp
+	InsertedAt() *commonpb.Timestamp
 	RevertedBy() uint64
 	RevertedAt() *commonpb.Timestamp
 	RevertsTransaction() uint64
@@ -671,12 +722,55 @@ func genAccountFilterFree(depth int) *commonpb.QueryFilter {
 	return genBoolean(depth, genAccountFilterFree)
 }
 
+// txFilterSeeds carries committed-state samples the transaction filter
+// generator aims at, so index-backed leaves hit live data instead of always
+// missing: committed references and learned date stamps. Sampled under the
+// checker's lock (sampleTxFilterSeeds) — the generator itself runs outside it.
+type txFilterSeeds struct {
+	refs   []string
+	stamps []uint64
+}
+
+// sampleTxFilterSeeds snapshots up to a handful of committed references and
+// known date stamps of the ledger. Acquires c.mu.
+func (c *Checker) sampleTxFilterSeeds(ledger string) txFilterSeeds {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	var seeds txFilterSeeds
+
+	ls := c.modelState.Ledger(ledger)
+	for ref := range ls.TxByRef() {
+		seeds.refs = append(seeds.refs, ref)
+		if len(seeds.refs) == 4 {
+			break
+		}
+	}
+
+	txs := ls.Txs()
+	for range 4 {
+		if len(txs) == 0 {
+			break
+		}
+
+		rec := txs[internal.Rand().Intn(len(txs))]
+		for _, ts := range []*commonpb.Timestamp{rec.Timestamp(), rec.InsertedAt(), rec.RevertedAt()} {
+			if ts != nil {
+				seeds.stamps = append(seeds.stamps, ts.GetData())
+			}
+		}
+	}
+
+	return seeds
+}
+
 // genTransactionFilter rolls a query filter for ListTransactions. One-in-six is
-// an index-backed metadata condition (the NotFound path); ~1-in-16 is an
-// accounts-only condition invalid on this target (the InvalidArgument path);
-// then one-in-four is the no-filter universe; the rest are index-free reverted /
-// tx-id filters and boolean compositions.
-func genTransactionFilter() *commonpb.QueryFilter {
+// an index-backed metadata condition (a never-built index — the NotFound path);
+// ~1-in-16 is an accounts-only condition invalid on this target (the
+// InvalidArgument path); then one-in-four is the no-filter universe; the rest
+// split between the index-backed tx-builtin grammar (reference / date leaves,
+// freely composed with index-free ones) and the pure index-free grammar.
+func genTransactionFilter(seeds txFilterSeeds) *commonpb.QueryFilter {
 	switch {
 	case random.RandomChoice([]uint8{0, 1, 2, 3, 4, 5}) == 0:
 		return filterMetaExists(metaKey())
@@ -685,9 +779,85 @@ func genTransactionFilter() *commonpb.QueryFilter {
 		return filterHasAsset("USD", 2)
 	case random.RandomChoice([]uint8{0, 1, 2, 3}) == 0:
 		return nil // top-level universe (no filter)
+	case random.RandomChoice([]uint8{0, 1}) == 0:
+		return genTransactionFilterIndexed(seeds, 0)
 	default:
 		return genTransactionFilterFree(0)
 	}
+}
+
+// genTransactionFilterIndexed rolls a transactions filter whose leaves include
+// the index-backed tx builtins — reference and the three date fields — mixed
+// with the index-free leaves. Unlike has-asset on accounts, every tx leaf
+// selects from the same transaction-log universe, so composition needs no
+// special casing: the window evaluator handles any boolean of these.
+func genTransactionFilterIndexed(seeds txFilterSeeds, depth int) *commonpb.QueryFilter {
+	if depth >= maxQueryGenDepth || random.RandomChoice([]uint8{0, 1}) == 0 {
+		switch random.RandomChoice([]uint8{0, 1, 2, 3}) {
+		case 0:
+			return filterReference(seedReference(seeds))
+		case 1, 2:
+			return genDateLeaf(seeds)
+		default:
+			return genTransactionFilterFree(depth)
+		}
+	}
+
+	return genBoolean(depth, func(d int) *commonpb.QueryFilter { return genTransactionFilterIndexed(seeds, d) })
+}
+
+// seedReference picks a committed reference most of the time, a miss otherwise
+// (an unknown reference, or the empty string — never indexed, matches nothing).
+func seedReference(seeds txFilterSeeds) string {
+	switch {
+	case len(seeds.refs) > 0 && !oneIn(4):
+		return seeds.refs[internal.Rand().Intn(len(seeds.refs))]
+	case oneIn(8):
+		return ""
+	default:
+		return "t-ref:absent"
+	}
+}
+
+// genDateLeaf rolls a range condition on one of the three date builtins,
+// bounded by committed stamps so it actually straddles live records: two seed
+// stamps as [min, max] (single-sided or exclusive variants occasionally), or
+// unconstrained bounds when the ledger has no known stamps yet.
+func genDateLeaf(seeds txFilterSeeds) *commonpb.QueryFilter {
+	fields := []commonpb.TransactionBuiltinIndex{
+		commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_TIMESTAMP,
+		commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_INSERTED_AT,
+		commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_REVERTED_AT,
+	}
+	field := fields[int(random.RandomChoice([]uint8{0, 1, 2}))]
+
+	pick := func() uint64 {
+		if len(seeds.stamps) == 0 {
+			return internal.Rand().Uint64() % 1024
+		}
+
+		return seeds.stamps[internal.Rand().Intn(len(seeds.stamps))]
+	}
+
+	a, b := pick(), pick()
+	if a > b {
+		a, b = b, a
+	}
+
+	f := filterDateRange(field, a, b)
+	cond := f.GetBuiltinUint().GetCond()
+	if oneIn(4) {
+		cond.Min = nil
+	} else {
+		cond.MinExclusive = oneIn(4)
+	}
+	if oneIn(4) {
+		cond.Max = nil
+	} else {
+		cond.MaxExclusive = oneIn(4)
+	}
+
+	return f
 }
 
 // genTransactionFilterFree rolls a non-nil index-free transactions filter: a
@@ -737,6 +907,12 @@ func filterAddrExact(addr string) *commonpb.QueryFilter {
 	}}}
 }
 
+func filterReference(value string) *commonpb.QueryFilter {
+	return &commonpb.QueryFilter{Filter: &commonpb.QueryFilter_Reference{Reference: &commonpb.ReferenceCondition{
+		Cond: &commonpb.StringCondition{Value: &commonpb.StringCondition_Hardcoded{Hardcoded: value}},
+	}}}
+}
+
 func filterReverted(value bool) *commonpb.QueryFilter {
 	return &commonpb.QueryFilter{Filter: &commonpb.QueryFilter_Reverted{
 		Reverted: &commonpb.RevertedCondition{Value: value},
@@ -748,6 +924,15 @@ func filterReverted(value bool) *commonpb.QueryFilter {
 func filterTxIDRange(lo, hi uint64) *commonpb.QueryFilter {
 	return &commonpb.QueryFilter{Filter: &commonpb.QueryFilter_BuiltinUint{BuiltinUint: &commonpb.BuiltinUintCondition{
 		Field: commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_ID,
+		Cond:  &commonpb.UintCondition{Min: &lo, Max: &hi},
+	}}}
+}
+
+// filterDateRange matches transactions whose `field` date lies in [lo, hi],
+// both bounds inclusive (like filterTxIDRange).
+func filterDateRange(field commonpb.TransactionBuiltinIndex, lo, hi uint64) *commonpb.QueryFilter {
+	return &commonpb.QueryFilter{Filter: &commonpb.QueryFilter_BuiltinUint{BuiltinUint: &commonpb.BuiltinUintCondition{
+		Field: field,
 		Cond:  &commonpb.UintCondition{Min: &lo, Max: &hi},
 	}}}
 }
@@ -798,6 +983,51 @@ func filterNeedsIndex(f *commonpb.QueryFilter, target commonpb.QueryTarget) bool
 
 	return asset || other
 }
+
+// neededIndexCanonicals collects the canonical IndexIDs a TRANSACTIONS filter
+// needs the compiler to find READY: the tx builtins the workload actually
+// churns (reference, the date fields), plus a sentinel for any index-backed
+// leaf whose index the workload never creates (metadata Field,
+// address-on-transactions) — the sentinel is never in the model's index set, so
+// those filters always predict rejection. The set drives the per-index
+// lifecycle validation (validateIndexedTransactionQuery); empty means the
+// filter is index-free and validates exactly.
+func neededIndexCanonicals(f *commonpb.QueryFilter, out map[string]struct{}) {
+	if f == nil {
+		return
+	}
+
+	switch x := f.GetFilter().(type) {
+	case *commonpb.QueryFilter_And:
+		for _, child := range x.And.GetFilters() {
+			neededIndexCanonicals(child, out)
+		}
+	case *commonpb.QueryFilter_Or:
+		for _, child := range x.Or.GetFilters() {
+			neededIndexCanonicals(child, out)
+		}
+	case *commonpb.QueryFilter_Not:
+		neededIndexCanonicals(x.Not.GetFilter(), out)
+	case *commonpb.QueryFilter_Reference:
+		out[txBuiltinCanonical(commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_REFERENCE)] = struct{}{}
+	case *commonpb.QueryFilter_BuiltinUint:
+		if x.BuiltinUint.GetField() != commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_ID {
+			out[txBuiltinCanonical(x.BuiltinUint.GetField())] = struct{}{}
+		}
+	case *commonpb.QueryFilter_Reverted:
+		// index-free
+	default:
+		// Field, address-on-transactions, log conditions: index-backed leaves
+		// whose index the workload never creates.
+		out[neverBuiltIndexCanonical] = struct{}{}
+	}
+}
+
+// neverBuiltIndexCanonical is the sentinel canonical for index-backed leaves
+// the workload never builds an index for. It never appears in the model's index
+// set, so IndexState reports it absent — a rejection is always legal, results
+// never are.
+const neverBuiltIndexCanonical = "workload:never-built"
 
 // indexNeeds classifies f's index requirements into two buckets: `asset` is set
 // if any leaf needs the account-by-asset builtin (an AccountHasAsset condition),
@@ -916,24 +1146,89 @@ func matchAccountFilter(ls oracle.LedgerState, f *commonpb.QueryFilter, addr str
 }
 
 // matchTxFilter evaluates an index-free transactions filter against one record.
-func matchTxFilter(f *commonpb.QueryFilter, rec txRecordView) bool {
+// matchTxFilter evaluates f on rec three-valued: known=false means the leaf
+// verdict hinges on a server stamp the model has not learned yet (a date field
+// of a bulk still in flight — see oracle.LearnTxStamps). Booleans propagate
+// unknowns Kleene-style: a decided AND/OR short-circuits, an undecided one
+// stays unknown. Window construction turns unknown rows into optional ones.
+func matchTxFilter(f *commonpb.QueryFilter, rec txRecordView) (match, known bool) {
 	if f == nil {
-		return true
+		return true, true
 	}
 
 	switch x := f.GetFilter().(type) {
 	case *commonpb.QueryFilter_Reverted:
-		return rec.Reverted() == x.Reverted.GetValue()
+		return rec.Reverted() == x.Reverted.GetValue(), true
+	case *commonpb.QueryFilter_Reference:
+		// Exact match on the null-terminated txref key; empty references are
+		// never written to the index, so they can never match.
+		return rec.Reference() != "" && rec.Reference() == x.Reference.GetCond().GetHardcoded(), true
 	case *commonpb.QueryFilter_BuiltinUint:
-		return matchTxIDBounds(x.BuiltinUint.GetCond(), rec.Id())
+		return matchTxBuiltinUint(x.BuiltinUint, rec)
 	case *commonpb.QueryFilter_And:
-		return matchAll(x.And.GetFilters(), func(child *commonpb.QueryFilter) bool { return matchTxFilter(child, rec) })
+		match, known = true, true
+		for _, child := range x.And.GetFilters() {
+			m, k := matchTxFilter(child, rec)
+			if k && !m {
+				return false, true
+			}
+			known = known && k
+		}
+
+		return match, known
 	case *commonpb.QueryFilter_Or:
-		return matchAny(x.Or.GetFilters(), func(child *commonpb.QueryFilter) bool { return matchTxFilter(child, rec) })
+		match, known = false, true
+		for _, child := range x.Or.GetFilters() {
+			m, k := matchTxFilter(child, rec)
+			if k && m {
+				return true, true
+			}
+			known = known && k
+		}
+
+		return match, known
 	case *commonpb.QueryFilter_Not:
-		return !matchTxFilter(x.Not.GetFilter(), rec)
+		m, k := matchTxFilter(x.Not.GetFilter(), rec)
+
+		return !m, k
 	default:
-		return false
+		return false, true
+	}
+}
+
+// matchTxBuiltinUint evaluates a transaction builtin-uint leaf. The date
+// builtins read the record's (possibly learned) server stamps; a still-unknown
+// stamp is an unknown verdict, not a miss — the record may well be in the
+// server's index.
+func matchTxBuiltinUint(cond *commonpb.BuiltinUintCondition, rec txRecordView) (match, known bool) {
+	switch cond.GetField() {
+	case commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_ID:
+		return matchTxIDBounds(cond.GetCond(), rec.Id()), true
+	case commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_TIMESTAMP:
+		if rec.Timestamp() == nil {
+			return false, false
+		}
+
+		return matchTxIDBounds(cond.GetCond(), rec.Timestamp().GetData()), true
+	case commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_INSERTED_AT:
+		if rec.InsertedAt() == nil {
+			return false, false
+		}
+
+		return matchTxIDBounds(cond.GetCond(), rec.InsertedAt().GetData()), true
+	case commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_REVERTED_AT:
+		// Only reverted originals carry an rvat row. An un-reverted record is a
+		// known miss; a reverted one with an unlearned revert stamp is unknown.
+		if !rec.Reverted() {
+			return false, true
+		}
+		if rec.RevertedAt() == nil {
+			return false, false
+		}
+
+		return matchTxIDBounds(cond.GetCond(), rec.RevertedAt().GetData()), true
+	default:
+		return false, true
 	}
 }
 
@@ -998,12 +1293,6 @@ func reverseStrings(s []string) {
 	}
 }
 
-func reverseUint64(s []uint64) {
-	for i, j := 0, len(s)-1; i < j; i, j = i+1, j-1 {
-		s[i], s[j] = s[j], s[i]
-	}
-}
-
 func joinUint64(s []uint64) string {
 	parts := make([]string, len(s))
 	for i, v := range s {
@@ -1032,8 +1321,10 @@ func describeFilter(f *commonpb.QueryFilter) string {
 		return "addr?"
 	case *commonpb.QueryFilter_Reverted:
 		return "reverted=" + strconv.FormatBool(x.Reverted.GetValue())
+	case *commonpb.QueryFilter_Reference:
+		return "ref=" + x.Reference.GetCond().GetHardcoded()
 	case *commonpb.QueryFilter_BuiltinUint:
-		return "id[" + strconv.FormatUint(x.BuiltinUint.GetCond().GetMin(), 10) + "," + strconv.FormatUint(x.BuiltinUint.GetCond().GetMax(), 10) + "]"
+		return describeBuiltinUint(x.BuiltinUint)
 	case *commonpb.QueryFilter_And:
 		return "and(" + describeChildren(x.And.GetFilters()) + ")"
 	case *commonpb.QueryFilter_Or:
@@ -1047,6 +1338,37 @@ func describeFilter(f *commonpb.QueryFilter) string {
 	default:
 		return "?"
 	}
+}
+
+// describeBuiltinUint renders a builtin-uint leaf: the field's short name and
+// its bounds, exclusive bounds parenthesized, absent ones as "_".
+func describeBuiltinUint(c *commonpb.BuiltinUintCondition) string {
+	name := map[commonpb.TransactionBuiltinIndex]string{
+		commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_ID:          "id",
+		commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_TIMESTAMP:   "ts",
+		commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_INSERTED_AT: "iat",
+		commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_REVERTED_AT: "rvat",
+	}[c.GetField()]
+	if name == "" {
+		name = c.GetField().String()
+	}
+
+	cond := c.GetCond()
+	lo, hi := "_", "_"
+	if cond.Min != nil {
+		lo = strconv.FormatUint(cond.GetMin(), 10)
+		if cond.GetMinExclusive() {
+			lo = "(" + lo
+		}
+	}
+	if cond.Max != nil {
+		hi = strconv.FormatUint(cond.GetMax(), 10)
+		if cond.GetMaxExclusive() {
+			hi += ")"
+		}
+	}
+
+	return name + "[" + lo + "," + hi + "]"
 }
 
 func describeChildren(children []*commonpb.QueryFilter) string {

@@ -148,15 +148,23 @@ func TestMatchTxFilter(t *testing.T) {
 	txs := ls.Txs()
 	require.Len(t, txs, 3)
 
-	require.True(t, matchTxFilter(filterReverted(true), txs[0]))
-	require.False(t, matchTxFilter(filterReverted(false), txs[0]))
-	require.True(t, matchTxFilter(filterReverted(false), txs[1]))
+	// These leaves never read a server stamp, so every verdict must be known.
+	matchKnown := func(f *commonpb.QueryFilter, rec txRecordView) bool {
+		m, known := matchTxFilter(f, rec)
+		require.True(t, known)
 
-	require.True(t, matchTxFilter(filterTxIDRange(1, 2), txs[0]))
-	require.False(t, matchTxFilter(filterTxIDRange(1, 2), txs[2]))
+		return m
+	}
 
-	require.True(t, matchTxFilter(filterNot(filterReverted(true)), txs[1]))
-	require.True(t, matchTxFilter(filterAnd(filterReverted(true), filterTxIDRange(1, 2)), txs[0]))
+	require.True(t, matchKnown(filterReverted(true), txs[0]))
+	require.False(t, matchKnown(filterReverted(false), txs[0]))
+	require.True(t, matchKnown(filterReverted(false), txs[1]))
+
+	require.True(t, matchKnown(filterTxIDRange(1, 2), txs[0]))
+	require.False(t, matchKnown(filterTxIDRange(1, 2), txs[2]))
+
+	require.True(t, matchKnown(filterNot(filterReverted(true)), txs[1]))
+	require.True(t, matchKnown(filterAnd(filterReverted(true), filterTxIDRange(1, 2)), txs[0]))
 }
 
 func TestAccountUniverse_OrderIsByteAscending(t *testing.T) {
@@ -231,4 +239,142 @@ func TestTransactionWindow(t *testing.T) {
 	// Filtered, reverse=false → matches ids 2,3 in descending order.
 	require.Equal(t, []uint64{3, 2},
 		transactionWindow(ls, filterTxIDRange(2, 3), 0, 10, false))
+}
+
+// --- Phase 2: tx-builtin leaves and the fuzzy window ----------------------
+
+func stamp(v uint64) *commonpb.Timestamp { return &commonpb.Timestamp{Data: v} }
+
+// buildGlobal applies reqs as one bulk and returns the global state, for tests
+// that need LearnTxStamps on top of the applied records.
+func buildGlobal(t *testing.T, reqs ...*servicepb.Request) oracle.GlobalState {
+	t.Helper()
+
+	res := oracle.NewGlobalState().Apply(oracle.Bulk{Requests: reqs})
+	require.True(t, res.OK, "setup bulk rejected: %s", res.Reason)
+
+	return res.State
+}
+
+// serverTxFromRec builds the wire transaction the server would return for a
+// fully-known model record, so txWindowMatches' content check passes.
+func serverTxFromRec(rec txRecordView) *commonpb.Transaction {
+	return &commonpb.Transaction{
+		Id:                    rec.Id(),
+		Reference:             rec.Reference(),
+		Reverted:              rec.Reverted(),
+		RevertedByTransaction: rec.RevertedBy(),
+		RevertsTransaction:    rec.RevertsTransaction(),
+		Timestamp:             rec.Timestamp(),
+		RevertedAt:            rec.RevertedAt(),
+		Postings:              rec.Postings(),
+		Metadata:              rec.Metadata(),
+	}
+}
+
+func TestMatchTxFilter_TxBuiltinLeaves(t *testing.T) {
+	t.Parallel()
+
+	// tx 1 (ref r1), tx 2, tx 3 = revert of 2. Stamps learned as the checker
+	// would from the commit response; tx 2's reverted_at is tx 3's timestamp.
+	gs := buildGlobal(t,
+		oracletest.TxReqRefL("L", "r1", "world", "acc:1", "USD", 5),
+		oracletest.TxReqL("L", "world", "acc:2", "USD", 5),
+		oracletest.RevertReqL("L", 2, true),
+	)
+	gs.LearnTxStamps("L", 1, stamp(100), stamp(110), nil)
+	gs.LearnTxStamps("L", 2, stamp(200), stamp(210), nil)
+	gs.LearnTxStamps("L", 3, stamp(300), stamp(310), nil)
+	gs.LearnTxStamps("L", 2, nil, nil, stamp(300))
+
+	txs := gs.Ledger("L").Txs()
+
+	known := func(f *commonpb.QueryFilter, rec txRecordView) bool {
+		m, k := matchTxFilter(f, rec)
+		require.True(t, k)
+
+		return m
+	}
+
+	// Reference: exact match; records without one never match, nor does "".
+	require.True(t, known(filterReference("r1"), txs[0]))
+	require.False(t, known(filterReference("r1"), txs[1]))
+	require.False(t, known(filterReference("absent"), txs[0]))
+	require.False(t, known(filterReference(""), txs[2]))
+
+	// Learned timestamp / inserted_at ranges.
+	require.False(t, known(filterDateRange(commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_TIMESTAMP, 150, 250), txs[0]))
+	require.True(t, known(filterDateRange(commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_TIMESTAMP, 150, 250), txs[1]))
+	require.True(t, known(filterDateRange(commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_INSERTED_AT, 305, 315), txs[2]))
+
+	// reverted_at: only the reverted original matches; un-reverted is a known miss.
+	rvat := filterDateRange(commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_REVERTED_AT, 250, 350)
+	require.True(t, known(rvat, txs[1]))
+	require.False(t, known(rvat, txs[0]))
+	require.False(t, known(rvat, txs[2]))
+}
+
+func TestMatchTxFilter_UnknownStamps(t *testing.T) {
+	t.Parallel()
+
+	// No stamps learned: date verdicts are unknown, and booleans propagate
+	// Kleene-style — decided by a known false (AND) or known true (OR).
+	ls := buildLedger(t, oracletest.TxReq("world", "acc:1", "USD", 5))
+	rec := ls.Txs()[0]
+
+	tsLeaf := filterDateRange(commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_TIMESTAMP, 1, 2)
+
+	_, k := matchTxFilter(tsLeaf, rec)
+	require.False(t, k)
+
+	_, k = matchTxFilter(filterNot(tsLeaf), rec)
+	require.False(t, k)
+
+	m, k := matchTxFilter(filterAnd(filterReverted(true), tsLeaf), rec)
+	require.True(t, k, "AND decided by the known-false reverted leaf")
+	require.False(t, m)
+
+	m, k = matchTxFilter(filterOr(filterReverted(false), tsLeaf), rec)
+	require.True(t, k, "OR decided by the known-true reverted leaf")
+	require.True(t, m)
+
+	_, k = matchTxFilter(filterOr(filterReverted(true), tsLeaf), rec)
+	require.False(t, k, "OR undecided when the known leaf misses")
+}
+
+func TestTxWindowMatches_OptionalRows(t *testing.T) {
+	t.Parallel()
+
+	// Three creates; stamps learned for 1 and 3 only — under a date filter
+	// covering both, tx 2 is an optional row (unknown verdict).
+	gs := buildGlobal(t,
+		oracletest.TxReqL("L", "world", "acc:1", "USD", 5),
+		oracletest.TxReqL("L", "world", "acc:2", "USD", 5),
+		oracletest.TxReqL("L", "world", "acc:3", "USD", 5),
+	)
+	gs.LearnTxStamps("L", 1, stamp(100), stamp(100), nil)
+	gs.LearnTxStamps("L", 3, stamp(300), stamp(300), nil)
+
+	ls := gs.Ledger("L")
+	txs := ls.Txs()
+	filter := filterDateRange(commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_TIMESTAMP, 50, 400)
+
+	// reverse=true is ascending on the transactions target.
+	page := func(ids ...uint64) []*commonpb.Transaction {
+		out := make([]*commonpb.Transaction, len(ids))
+		for i, id := range ids {
+			out[i] = serverTxFromRec(txs[id-1])
+		}
+
+		return out
+	}
+
+	require.True(t, txWindowMatches(ls, filter, 0, 10, true, page(1, 3)), "optional row absent")
+	require.True(t, txWindowMatches(ls, filter, 0, 10, true, page(1, 2, 3)), "optional row present")
+	require.False(t, txWindowMatches(ls, filter, 0, 10, true, page(3, 1)), "order violation")
+	require.False(t, txWindowMatches(ls, filter, 0, 10, true, page(1)), "required row missing with page room")
+	require.True(t, txWindowMatches(ls, filter, 0, 1, true, page(1)), "full page truncates the rest")
+	require.False(t, txWindowMatches(ls, filter, 0, 10, true, page(2, 3)), "required first row missing")
+	require.True(t, txWindowMatches(ls, filter, 1, 10, true, page(2, 3)), "cursor drops tx 1; optional 2 present")
+	require.True(t, txWindowMatches(ls, filter, 1, 10, true, page(3)), "cursor drops tx 1; optional 2 absent")
 }

@@ -326,6 +326,35 @@ func (c *Checker) crossCheckCommit(bulk oracle.Bulk, resp *servicepb.ApplyRespon
 	}
 
 	c.modelState = res.State
+	learnTxStamps(c.modelState, bulk, logs)
+}
+
+// learnTxStamps folds the server-stamped transaction dates from a committed
+// bulk's response logs into the just-advanced model state (LearnTxStamps): the
+// created/revert transaction's timestamp and inserted_at, and the reverted
+// original's reverted_at (the compensating transaction's timestamp). Runs in
+// the same critical section that advanced the state — the safety condition
+// LearnTxStamps documents.
+func learnTxStamps(gs oracle.GlobalState, bulk oracle.Bulk, logs []*commonpb.Log) {
+	for i, req := range bulk.Requests {
+		if i >= len(logs) {
+			break
+		}
+
+		ledger := oracle.LedgerOf(req)
+		data := logs[i].GetPayload().GetApply().GetLog().GetData()
+
+		switch {
+		case data.GetCreatedTransaction() != nil:
+			tx := data.GetCreatedTransaction().GetTransaction()
+			gs.LearnTxStamps(ledger, tx.GetId(), tx.GetTimestamp(), tx.GetInsertedAt(), nil)
+		case data.GetRevertedTransaction() != nil:
+			rt := data.GetRevertedTransaction()
+			revTx := rt.GetRevertTransaction()
+			gs.LearnTxStamps(ledger, revTx.GetId(), revTx.GetTimestamp(), revTx.GetInsertedAt(), nil)
+			gs.LearnTxStamps(ledger, rt.GetRevertedTransactionId(), nil, nil, revTx.GetTimestamp())
+		}
+	}
 }
 
 // validateFailure accepts the observed failure of failedBulk iff some

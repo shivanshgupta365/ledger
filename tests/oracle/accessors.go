@@ -39,6 +39,7 @@ func (t *txRecord) Postings() []*commonpb.Posting                { return t.post
 func (t *txRecord) Metadata() map[string]*commonpb.MetadataValue { return t.metadata }
 func (t *txRecord) Reverted() bool                               { return t.reverted }
 func (t *txRecord) Timestamp() *commonpb.Timestamp               { return t.timestamp }
+func (t *txRecord) InsertedAt() *commonpb.Timestamp              { return t.insertedAt }
 func (t *txRecord) RevertedBy() uint64                           { return t.revertedBy }
 func (t *txRecord) RevertedAt() *commonpb.Timestamp              { return t.revertedAt }
 func (t *txRecord) RevertsTransaction() uint64                   { return t.revertsTransaction }
@@ -120,3 +121,37 @@ func (m *metaEffect) Saved() map[string]*commonpb.MetadataValue { return m.saved
 
 func (r *revertEffect) RevertedID() uint64            { return r.revertedID }
 func (r *revertEffect) Postings() []*commonpb.Posting { return r.postings }
+
+// LearnTxStamps fills the server-stamped dates of transaction id that the model
+// could not predict at apply time: a nil timestamp, the always-server-stamped
+// insertedAt, and a nil revertedAt on a reverted original. Known (client-
+// supplied) values are never overwritten — reads validate those directly. The
+// values come from the commit response's logs; they are deterministic FSM
+// outputs, so folding them in keeps the model exact and lets later reads and
+// filter windows check them for equality instead of skipping.
+//
+// Mutation safety: the record pointer is replaced, not mutated, but the txs
+// backing array IS written in place. The caller must hold the checker's lock
+// and call this only on the committed state, in the same critical section that
+// advanced it — before any candidate fork of the new state is taken. Forks of
+// earlier states own their backing arrays (clone copies the slice), so they are
+// unaffected.
+func (g GlobalState) LearnTxStamps(ledger string, id uint64, timestamp, insertedAt, revertedAt *commonpb.Timestamp) {
+	ls, ok := g.ledgers[ledger]
+	if !ok || id == 0 || id > uint64(len(ls.txs)) {
+		return
+	}
+
+	rec := *ls.txs[id-1]
+	if rec.timestamp == nil {
+		rec.timestamp = timestamp
+	}
+	if rec.insertedAt == nil {
+		rec.insertedAt = insertedAt
+	}
+	if rec.revertedAt == nil && rec.reverted {
+		rec.revertedAt = revertedAt
+	}
+
+	ls.txs[id-1] = &rec
+}

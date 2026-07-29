@@ -18,11 +18,12 @@ import (
 	"github.com/formancehq/ledger/v3/tests/antithesis/workload/internal"
 )
 
-// Index lifecycle. The account query surface can filter on AccountHasAsset, a
-// condition the compiler serves only from the account-by-asset builtin index. To
-// exercise that path with validated results (not just the not-found rejection),
-// the generator emits CreateIndex / DropIndex bulks for that index and the model
-// tracks each index's lifecycle:
+// Index lifecycle. The query surface has index-backed conditions the compiler
+// serves only from created indexes: AccountHasAsset (account-by-asset builtin)
+// on accounts, and reference / date builtins on transactions. To exercise those
+// paths with validated results (not just the not-found rejection), the
+// generator emits CreateIndex / DropIndex bulks for each (workloadIndexes) and
+// the model tracks each index's lifecycle:
 //
 //   - absent — no index. A has-asset query must be rejected (FailedPrecondition).
 //   - ambiguous — created, but not yet confirmed READY on every replica. A query
@@ -45,6 +46,40 @@ func assetIndexID() *commonpb.IndexID {
 }
 
 var assetIndexCanonical = indexes.Canonical(assetIndexID())
+
+// workloadTxBuiltins are the transaction builtin indexes the generator churns:
+// the index-backed leaves of the transactions filter grammar (reference and the
+// three date fields).
+var workloadTxBuiltins = []commonpb.TransactionBuiltinIndex{
+	commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_REFERENCE,
+	commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_TIMESTAMP,
+	commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_INSERTED_AT,
+	commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_REVERTED_AT,
+}
+
+// txBuiltinCanonical returns the canonical IndexID string of a tx builtin — the
+// model's index-map key the filter classifier and the lifecycle validation
+// share.
+func txBuiltinCanonical(field commonpb.TransactionBuiltinIndex) string {
+	return indexes.Canonical(indexes.TxBuiltinID(field))
+}
+
+// workloadIndex is one index the generator churns: its wire ID and canonical key.
+type workloadIndex struct {
+	id        *commonpb.IndexID
+	canonical string
+}
+
+// workloadIndexes is every index the workload creates and drops: the
+// account-by-asset builtin plus the tx builtins.
+func workloadIndexes() []workloadIndex {
+	out := []workloadIndex{{assetIndexID(), assetIndexCanonical}}
+	for _, field := range workloadTxBuiltins {
+		out = append(out, workloadIndex{indexes.TxBuiltinID(field), txBuiltinCanonical(field)})
+	}
+
+	return out
+}
 
 // indexStateLabel renders an index's model lifecycle state for finding details.
 func indexStateLabel(exists, active bool) string {
@@ -260,23 +295,26 @@ func dropIndexReq(ledger string, id *commonpb.IndexID) *servicepb.Request {
 	}}
 }
 
-// rollIndexOp: ~1-in-16 a bulk is an account-by-asset index create/drop rather
-// than ledger traffic, churning the index lifecycle the has-asset queries probe.
+// rollIndexOp: ~1-in-16 a bulk is an index create/drop rather than ledger
+// traffic, churning the index lifecycles the indexed queries probe.
 func rollIndexOp() bool {
 	return oneIn(16)
 }
 
-// generateIndexOp creates the account-by-asset index when the ledger has none,
-// else occasionally drops it (so the lifecycle keeps cycling) and otherwise
+// generateIndexOp picks one workload index; creates it when the ledger lacks
+// it, else occasionally drops it (so the lifecycle keeps cycling) and otherwise
 // leaves it in place for queries to validate against. Reads committed state only.
 func generateIndexOp(g oracle.GlobalState, ledger string) *servicepb.Request {
-	exists, _ := g.Ledger(ledger).IndexState(assetIndexCanonical)
+	all := workloadIndexes()
+	pick := all[internal.Rand().Intn(len(all))]
+
+	exists, _ := g.Ledger(ledger).IndexState(pick.canonical)
 	if !exists {
-		return createIndexReq(ledger, assetIndexID())
+		return createIndexReq(ledger, pick.id)
 	}
 
 	if oneIn(3) {
-		return dropIndexReq(ledger, assetIndexID())
+		return dropIndexReq(ledger, pick.id)
 	}
 
 	return nil
@@ -382,17 +420,107 @@ func reconcileIndexes(ctx context.Context, c *Checker, conns internal.PerNodeCon
 				if !wasActive {
 					// Coverage: the poller confirmed the index READY on every replica
 					// and promoted it — after which its queries must return results.
-					assert.Reachable("singleton_driver_model: asset index promoted to active", internal.Details{"ledger": ledger})
+					assert.Reachable("singleton_driver_model: index promoted to active", internal.Details{"ledger": ledger, "index": canon})
 				}
 			} else {
 				c.modelState.SetIndexAmbiguous(ledger, canon)
 				if wasActive {
 					// Coverage: a replica reported the index not-ready again (node
 					// down / restored node rebuilding), demoting it back to ambiguous.
-					assert.Reachable("singleton_driver_model: asset index demoted to ambiguous", internal.Details{"ledger": ledger})
+					assert.Reachable("singleton_driver_model: index demoted to ambiguous", internal.Details{"ledger": ledger, "index": canon})
 				}
 			}
 		}
 		c.mu.Unlock()
 	}
+}
+
+// --- indexed transaction-query validation ----------------------------------
+
+// validateIndexedTransactionQuery validates a ListTransactions query whose
+// filter carries index-backed tx leaves. needed holds the canonical IndexIDs
+// the compiler must find READY. The legal outcomes per candidate base:
+//
+//   - a result set is legal iff the base holds every needed index (ambiguous or
+//     active) and the page is a legal window over the base's rows
+//     (txWindowMatches);
+//   - a not-ready rejection (FailedPrecondition) is legal iff some needed index
+//     is not active on the base (absent, ambiguous, or never built).
+//
+// Any other error code is a finding, as are rows without every needed index and
+// a rejection when every needed index is active on every base.
+func (c *Checker) validateIndexedTransactionQuery(maxTicket uint64, ledger string, filter *commonpb.QueryFilter, needed map[string]struct{}, afterID uint64, pageSize int, reverse bool, serverTxs []*commonpb.Transaction, err error) {
+	if err != nil && status.Code(err) != codes.FailedPrecondition {
+		assert.Unreachable("singleton_driver_model: indexed transaction query returned unexpected error", internal.Details{
+			"ledger": ledger,
+			"filter": describeFilter(filter),
+			"error":  err.Error(),
+		})
+
+		return
+	}
+
+	gotResults := err == nil
+
+	if c.matchesModel(maxTicket, "TXQUERY-IDX", func(cand oracle.GlobalState) bool {
+		ls := cand.Ledger(ledger)
+
+		if !gotResults {
+			for canon := range needed {
+				if exists, active := ls.IndexState(canon); !exists || !active {
+					return true
+				}
+			}
+
+			return false
+		}
+
+		for canon := range needed {
+			if exists, _ := ls.IndexState(canon); !exists {
+				return false
+			}
+		}
+
+		return txWindowMatches(ls, filter, afterID, pageSize, reverse, serverTxs)
+	}) {
+		if gotResults {
+			assert.Reachable("singleton_driver_model: indexed transaction query served results", internal.Details{"ledger": ledger})
+		} else {
+			assert.Reachable("singleton_driver_model: indexed transaction query gated", internal.Details{"ledger": ledger})
+		}
+
+		return
+	}
+
+	c.mu.Lock()
+	modelLS := c.modelState.Ledger(ledger)
+	idxStates := make([]string, 0, len(needed))
+	for canon := range needed {
+		exists, active := modelLS.IndexState(canon)
+		idxStates = append(idxStates, canon+"="+indexStateLabel(exists, active))
+	}
+	modelWindow := transactionWindow(modelLS, filter, afterID, pageSize, reverse)
+	c.mu.Unlock()
+
+	details := internal.Details{
+		"ledger":   ledger,
+		"filter":   describeFilter(filter),
+		"afterId":  afterID,
+		"pageSize": pageSize,
+		"reverse":  reverse,
+		"modelIdx": strings.Join(idxStates, " "),
+		"modelIds": joinUint64(modelWindow),
+	}
+	if gotResults {
+		serverIds := make([]uint64, len(serverTxs))
+		for i, t := range serverTxs {
+			serverIds[i] = t.GetId()
+		}
+		details["rows"] = len(serverTxs)
+		details["serverIds"] = joinUint64(serverIds)
+	} else {
+		details["error"] = err.Error()
+	}
+
+	assert.Unreachable("singleton_driver_model: indexed transaction query outside model", details)
 }
