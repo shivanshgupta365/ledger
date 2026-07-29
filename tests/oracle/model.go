@@ -609,6 +609,7 @@ func (g GlobalState) Apply(bulk Bulk) ApplyResult {
 			return ApplyResult{OK: false, Reason: reason, State: g, Orders: orders}
 		}
 
+		ls.recordAssetTouches(&base, cells)
 		ls.purgeZeroBalance(cells)
 	}
 
@@ -892,27 +893,46 @@ func (s *LedgerState) applyPostings(postings []*commonpb.Posting, force bool, to
 		bump(dstKey, &amt, &zero)
 	}
 
-	s.recordAssetTouches(pcv)
-
 	return pcv, ""
 }
 
-// recordAssetTouches folds this order's touched cells into the ever-touched
-// account-by-asset set, mirroring the read-store index writer: a posting's source
-// and destination are recorded for their (assetBase, precision) unless excluded —
-// the account is TRANSIENT (never persisted, never indexed) or the cell is
-// EPHEMERAL and this order left it zero (purged in this order's log, so the index
-// skips it). pcv holds this order's post-commit volume per touched cell. A touch
-// is permanent once recorded (the index never deletes keys), so a later
-// drain-to-zero and purge does not un-record it — hence recording here, at the
-// touching order, not from the surviving volume table.
-func (s *LedgerState) recordAssetTouches(pcv map[VolumeKey]VolumePair) {
+// recordAssetTouches folds this bulk's touched cells into the ever-touched
+// account-by-asset set, mirroring the read-store index writer. The index
+// builder walks every posting and skips cells in the exclusion projection
+// (LedgerLog.PurgedVolumes ∪ AppliedProposal.TransientVolumes), which the FSM
+// derives at END of bulk from the final merged volumes and the end-of-bulk
+// chart (partitionVolumes). Mirrored per touched cell:
+//
+//   - TRANSIENT-matched, all-zero pre-bulk value: steady-state transient —
+//     carried on TransientVolumes, excluded.
+//   - TRANSIENT-matched, non-zero pre-bulk value (grandfathered) or
+//     EPHEMERAL-matched: excluded when the bulk leaves the cell at zero
+//     balance (purged), recorded otherwise.
+//   - NORMAL or unmatched: always recorded.
+//
+// base is the pre-bulk state (the preloaded Old the server classifies on). A
+// touch is permanent once recorded (the index never deletes keys), so a purge
+// in a LATER bulk does not un-record it. Must run before purgeZeroBalance —
+// the classification reads the pre-purge end-of-bulk balance.
+func (s *LedgerState) recordAssetTouches(base *LedgerState, touched map[VolumeKey]bool) {
 	compiled := s.compiled()
-	for key, vp := range pcv {
+	for key := range touched {
+		vp, ok := s.volumes[key]
+		if !ok {
+			continue
+		}
+
 		if t := s.match(key.Address, compiled); t != nil {
 			switch t.Persistence {
 			case commonpb.AccountTypePersistence_ACCOUNT_TYPE_TRANSIENT:
-				continue
+				bv := base.vol(key)
+				if bv.Input.IsZero() && bv.Output.IsZero() {
+					continue
+				}
+
+				if vp.Input.Cmp(&vp.Output) == 0 {
+					continue
+				}
 			case commonpb.AccountTypePersistence_ACCOUNT_TYPE_EPHEMERAL:
 				if vp.Input.Cmp(&vp.Output) == 0 {
 					continue
@@ -920,8 +940,8 @@ func (s *LedgerState) recordAssetTouches(pcv map[VolumeKey]VolumePair) {
 			}
 		}
 
-		base, prec := domain.ParseAssetPrecision(key.Asset)
-		s.everAsset[assetTouch{address: key.Address, base: base, precision: uint32(prec)}] = struct{}{}
+		assetBase, prec := domain.ParseAssetPrecision(key.Asset)
+		s.everAsset[assetTouch{address: key.Address, base: assetBase, precision: uint32(prec)}] = struct{}{}
 	}
 }
 
