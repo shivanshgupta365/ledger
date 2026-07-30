@@ -34,12 +34,16 @@ import (
 // keys <= cursor, reverse drops keys >= cursor (PaginateForward / listDescFiltered).
 //
 // Index gating: the server's filter compiler serves most conditions from a
-// created index and returns NotFound when the index is absent. This workload
-// builds none, so a filter carrying any index-backed condition (see
-// filterNeedsIndex) is predicted to be rejected with NotFound rather than to
-// return rows. The index-free conditions — universe, address-on-accounts,
-// reverted, the tx-id builtin, and boolean compositions of these — return the
-// window the model computes.
+// created index and rejects the query when the index is absent or not yet
+// ready. The generator churns the full index lifecycle (indexes.go), so every
+// index-backed filter routes through the per-filter needed-set validation
+// (neededIndexCanonicals + validateIndexedAccountQuery /
+// validateIndexedTransactionQuery): results require every needed index and an
+// exact window, a not-ready rejection is legal only while some needed index is
+// not active, and a kind-mismatched Field leaf must be rejected as a
+// compilation error. The index-free conditions — universe,
+// address-on-accounts, reverted, the tx-id builtin, and boolean compositions
+// of these — always return the window the model computes.
 
 // queryPageSize is the page size a query read requests. Kept well under
 // MaxPageSize (1000) so the server never clamps it — the model uses the same
@@ -53,10 +57,10 @@ func queryPageSize() int {
 // queries carry an index-backed filter to exercise the NotFound rejection path.
 func runAccountQuery(ctx context.Context, client servicepb.BucketServiceClient, c *Checker) {
 	ledger := random.RandomChoice(c.ledgerNames)
-	filter := genAccountFilter()
-	assetNeed, otherNeed := indexNeeds(filter, commonpb.QueryTarget_QUERY_TARGET_ACCOUNTS)
-	needsIndex := assetNeed || otherNeed
-	assetOnly := assetNeed && !otherNeed
+	filter := genAccountFilter(c.sampleAccountFieldSeeds(ledger))
+	needed := map[string]struct{}{}
+	neededIndexCanonicals(filter, commonpb.QueryTarget_QUERY_TARGET_ACCOUNTS, needed)
+	_, _, bareAsset := hasAssetTarget(filter)
 	invalidTarget := filterInvalidForTarget(filter, commonpb.QueryTarget_QUERY_TARGET_ACCOUNTS)
 	pageSize := queryPageSize()
 	reverse := random.RandomChoice([]uint8{0, 1}) == 1
@@ -104,13 +108,14 @@ func runAccountQuery(ctx context.Context, client servicepb.BucketServiceClient, 
 		if handleInvalidTargetError(invalidTarget, "account", ledger, filter, err) {
 			return
 		}
-		if assetOnly {
+		if bareAsset {
 			// The account-by-asset index governs this filter's outcome; a not-ready
 			// error is legal while the index is absent or ambiguous.
 			c.validateAssetAccountQuery(maxTicket, ledger, filter, cursor, pageSize, reverse, nil, err)
 			return
 		}
-		if handleIndexGatedError(needsIndex, "account", ledger, filter, err) {
+		if len(needed) > 0 {
+			c.validateIndexedAccountQuery(maxTicket, ledger, filter, needed, cursor, pageSize, reverse, nil, err)
 			return
 		}
 
@@ -135,24 +140,26 @@ func runAccountQuery(ctx context.Context, client servicepb.BucketServiceClient, 
 		return
 	}
 
-	if assetOnly {
+	if bareAsset {
 		c.validateAssetAccountQuery(maxTicket, ledger, filter, cursor, pageSize, reverse, accounts, nil)
 		return
 	}
 
-	if needsIndex {
-		// Predicted NotFound but the server streamed rows: a non-asset index-backed
-		// filter returned results without the index the compiler requires.
-		assert.Unreachable("singleton_driver_model: index-gated account query returned results", internal.Details{
-			"ledger": ledger,
-			"filter": describeFilter(filter),
-			"rows":   len(accounts),
-		})
-
+	if len(needed) > 0 {
+		c.validateIndexedAccountQuery(maxTicket, ledger, filter, needed, cursor, pageSize, reverse, accounts, nil)
 		return
 	}
 
 	c.validateAccountQuery(maxTicket, ledger, filter, cursor, pageSize, reverse, accounts)
+}
+
+// sampleAccountFieldSeeds snapshots the ledger's declared account fields plus
+// value samples for the filter generator. Acquires c.mu.
+func (c *Checker) sampleAccountFieldSeeds(ledger string) []fieldSeed {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return sampleFieldSeeds(c.modelState.Ledger(ledger), commonpb.QueryTarget_QUERY_TARGET_ACCOUNTS)
 }
 
 // runTransactionQuery issues a linearizable ListTransactions and checks the
@@ -162,7 +169,7 @@ func runTransactionQuery(ctx context.Context, client servicepb.BucketServiceClie
 	ledger := random.RandomChoice(c.ledgerNames)
 	filter := genTransactionFilter(c.sampleTxFilterSeeds(ledger))
 	needed := map[string]struct{}{}
-	neededIndexCanonicals(filter, needed)
+	neededIndexCanonicals(filter, commonpb.QueryTarget_QUERY_TARGET_TRANSACTIONS, needed)
 	invalidTarget := filterInvalidForTarget(filter, commonpb.QueryTarget_QUERY_TARGET_TRANSACTIONS)
 	pageSize := queryPageSize()
 	reverse := random.RandomChoice([]uint8{0, 1}) == 1
@@ -241,35 +248,6 @@ func runTransactionQuery(ctx context.Context, client servicepb.BucketServiceClie
 	}
 
 	c.validateTransactionQuery(maxTicket, ledger, filter, afterID, pageSize, reverse, txs)
-}
-
-// handleIndexGatedError validates the error of an index-backed query. Such a
-// filter must be rejected with FailedPrecondition — ErrIndexNotFound and
-// ErrIndexBuilding both carry a Kind that maps there (kindToGRPCCode) — since
-// the workload never builds the index the compiler requires. Returns true when
-// it has fully handled err (predicted rejection reached, or its own finding
-// raised); false when err is not this path's concern.
-func handleIndexGatedError(needsIndex bool, kind, ledger string, filter *commonpb.QueryFilter, err error) bool {
-	if !needsIndex {
-		return false
-	}
-
-	if status.Code(err) == codes.FailedPrecondition {
-		// Coverage: the index-gating rejection is actually exercised. If this
-		// stops firing, the generator has stopped emitting index-backed filters.
-		assert.Reachable("singleton_driver_model: index-gated query rejected", internal.Details{"kind": kind})
-
-		return true
-	}
-
-	assert.Unreachable("singleton_driver_model: index-gated query returned unexpected error", internal.Details{
-		"kind":   kind,
-		"ledger": ledger,
-		"filter": describeFilter(filter),
-		"error":  err.Error(),
-	})
-
-	return true
 }
 
 // handleInvalidTargetError validates the error of a filter carrying a condition
@@ -687,9 +665,17 @@ func oneIn(n int) bool {
 // condition invalid on this target (the InvalidArgument path); then one-in-four
 // is the no-filter universe (a nil top-level filter); the rest are index-free
 // address filters and boolean compositions.
-func genAccountFilter() *commonpb.QueryFilter {
+func genAccountFilter(seeds []fieldSeed) *commonpb.QueryFilter {
 	switch {
-	case oneIn(6):
+	case oneIn(8):
+		// A Field leaf on an UNDECLARED key: the index-not-found probe.
+		return filterMetaExists("undeclared-" + metaKey())
+	case oneIn(12):
+		// A bare kind-mismatched Field leaf: the FILTER_COMPILATION probe.
+		if f := genMismatchedFieldLeaf(seeds); f != nil {
+			return f
+		}
+
 		return filterMetaExists(metaKey())
 	case oneIn(6):
 		return genAccountAssetFilter()
@@ -702,9 +688,28 @@ func genAccountFilter() *commonpb.QueryFilter {
 		return filterTxIDRange(0, 255)
 	case oneIn(4):
 		return nil // top-level universe (no filter)
+	case random.RandomChoice([]uint8{0, 1}) == 0:
+		return genAccountFilterIndexed(seeds, 0)
 	default:
 		return genAccountFilterFree(0)
 	}
+}
+
+// genAccountFilterIndexed rolls an accounts filter mixing metadata Field
+// leaves (on declared keys) with the index-free address leaves. Field results
+// select from the same current V+M universe address leaves scan — an account
+// carrying metadata always has an attributes row — so booleans compose without
+// the ever-touched-universe caveat that keeps has-asset bare.
+func genAccountFilterIndexed(seeds []fieldSeed, depth int) *commonpb.QueryFilter {
+	if depth >= maxQueryGenDepth || random.RandomChoice([]uint8{0, 1}) == 0 {
+		if f := genFieldLeaf(seeds); f != nil && random.RandomChoice([]uint8{0, 1, 2}) != 0 {
+			return f
+		}
+
+		return genAccountFilterFree(depth)
+	}
+
+	return genBoolean(depth, func(d int) *commonpb.QueryFilter { return genAccountFilterIndexed(seeds, d) })
 }
 
 // genAccountFilterFree rolls a non-nil index-free accounts filter: an address
@@ -730,6 +735,7 @@ func genAccountFilterFree(depth int) *commonpb.QueryFilter {
 type txFilterSeeds struct {
 	refs   []string
 	stamps []uint64
+	fields []fieldSeed
 }
 
 // sampleTxFilterSeeds snapshots up to a handful of committed references and
@@ -762,6 +768,8 @@ func (c *Checker) sampleTxFilterSeeds(ledger string) txFilterSeeds {
 		}
 	}
 
+	seeds.fields = sampleFieldSeeds(ls, commonpb.QueryTarget_QUERY_TARGET_TRANSACTIONS)
+
 	return seeds
 }
 
@@ -773,7 +781,15 @@ func (c *Checker) sampleTxFilterSeeds(ledger string) txFilterSeeds {
 // freely composed with index-free ones) and the pure index-free grammar.
 func genTransactionFilter(seeds txFilterSeeds) *commonpb.QueryFilter {
 	switch {
-	case random.RandomChoice([]uint8{0, 1, 2, 3, 4, 5}) == 0:
+	case oneIn(8):
+		// A Field leaf on an UNDECLARED key: the index-not-found probe.
+		return filterMetaExists("undeclared-" + metaKey())
+	case oneIn(12):
+		// A bare kind-mismatched Field leaf: the FILTER_COMPILATION probe.
+		if f := genMismatchedFieldLeaf(seeds.fields); f != nil {
+			return f
+		}
+
 		return filterMetaExists(metaKey())
 	case oneIn(16):
 		// Target-invalid probe: an accounts-only condition, rejected on transactions.
@@ -794,13 +810,19 @@ func genTransactionFilter(seeds txFilterSeeds) *commonpb.QueryFilter {
 // special casing: the window evaluator handles any boolean of these.
 func genTransactionFilterIndexed(seeds txFilterSeeds, depth int) *commonpb.QueryFilter {
 	if depth >= maxQueryGenDepth || random.RandomChoice([]uint8{0, 1}) == 0 {
-		switch random.RandomChoice([]uint8{0, 1, 2, 3, 4}) {
+		switch random.RandomChoice([]uint8{0, 1, 2, 3, 4, 5}) {
 		case 0:
 			return filterReference(seedReference(seeds))
 		case 1, 2:
 			return genDateLeaf(seeds)
 		case 3:
 			return genTxAddressLeaf()
+		case 4:
+			if f := genFieldLeaf(seeds.fields); f != nil {
+				return f
+			}
+
+			return genTransactionFilterFree(depth)
 		default:
 			return genTransactionFilterFree(depth)
 		}
@@ -993,8 +1015,9 @@ func filterNot(child *commonpb.QueryFilter) *commonpb.QueryFilter {
 }
 
 // filterMetaExists matches entities that carry metadata key — an existence
-// condition. It is index-backed on both targets, so in this index-free workload
-// it is the NotFound-path probe rather than a result-returning filter.
+// condition, index-backed on both targets. On a declared, indexed key it is a
+// result-returning filter; on an undeclared key it is the index-not-found
+// probe.
 func filterMetaExists(key string) *commonpb.QueryFilter {
 	return &commonpb.QueryFilter{Filter: &commonpb.QueryFilter_Field{Field: &commonpb.FieldCondition{
 		Field:     &commonpb.FieldRef{Metadata: key},
@@ -1027,15 +1050,18 @@ func filterNeedsIndex(f *commonpb.QueryFilter, target commonpb.QueryTarget) bool
 	return asset || other
 }
 
-// neededIndexCanonicals collects the canonical IndexIDs a TRANSACTIONS filter
-// needs the compiler to find READY: the tx builtins the workload actually
-// churns (reference, the date fields), plus a sentinel for any index-backed
-// leaf whose index the workload never creates (metadata Field,
-// address-on-transactions) — the sentinel is never in the model's index set, so
-// those filters always predict rejection. The set drives the per-index
-// lifecycle validation (validateIndexedTransactionQuery); empty means the
-// filter is index-free and validates exactly.
-func neededIndexCanonicals(f *commonpb.QueryFilter, out map[string]struct{}) {
+// neededIndexCanonicals collects the canonical IndexIDs a filter needs the
+// compiler to find READY on the given target: the tx builtins (reference, the
+// date fields, the address roles), the account-by-asset builtin, and the
+// per-(target, key) metadata indexes — plus a sentinel for any index-backed
+// leaf whose index the workload never creates. The sentinel is never in the
+// model's index set, so those filters always predict rejection. The set drives
+// the per-index lifecycle validation (validateIndexedTransactionQuery /
+// validateIndexedAccountQuery); empty means the filter is index-free and
+// validates exactly. Target-invalid leaves classify like their home target —
+// callers consult filterInvalidForTarget first, mirroring the compiler's
+// check order.
+func neededIndexCanonicals(f *commonpb.QueryFilter, target commonpb.QueryTarget, out map[string]struct{}) {
 	if f == nil {
 		return
 	}
@@ -1043,18 +1069,26 @@ func neededIndexCanonicals(f *commonpb.QueryFilter, out map[string]struct{}) {
 	switch x := f.GetFilter().(type) {
 	case *commonpb.QueryFilter_And:
 		for _, child := range x.And.GetFilters() {
-			neededIndexCanonicals(child, out)
+			neededIndexCanonicals(child, target, out)
 		}
 	case *commonpb.QueryFilter_Or:
 		for _, child := range x.Or.GetFilters() {
-			neededIndexCanonicals(child, out)
+			neededIndexCanonicals(child, target, out)
 		}
 	case *commonpb.QueryFilter_Not:
-		neededIndexCanonicals(x.Not.GetFilter(), out)
+		neededIndexCanonicals(x.Not.GetFilter(), target, out)
+	case *commonpb.QueryFilter_Field:
+		out[metadataCanonical(target, x.Field.GetField().GetMetadata())] = struct{}{}
+	case *commonpb.QueryFilter_AccountHasAsset:
+		out[assetIndexCanonical] = struct{}{}
 	case *commonpb.QueryFilter_Reference:
 		out[txBuiltinCanonical(commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_REFERENCE)] = struct{}{}
 	case *commonpb.QueryFilter_Address:
-		out[txBuiltinCanonical(addressRoleBuiltin(x.Address.GetRole()))] = struct{}{}
+		// Index-free on accounts (existence scan); the account→tx mapping
+		// index on transactions.
+		if target == commonpb.QueryTarget_QUERY_TARGET_TRANSACTIONS {
+			out[txBuiltinCanonical(addressRoleBuiltin(x.Address.GetRole()))] = struct{}{}
+		}
 	case *commonpb.QueryFilter_BuiltinUint:
 		if x.BuiltinUint.GetField() != commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_ID {
 			out[txBuiltinCanonical(x.BuiltinUint.GetField())] = struct{}{}
@@ -1062,8 +1096,7 @@ func neededIndexCanonicals(f *commonpb.QueryFilter, out map[string]struct{}) {
 	case *commonpb.QueryFilter_Reverted:
 		// index-free
 	default:
-		// Field, log conditions: index-backed leaves whose index the workload
-		// never creates.
+		// Log conditions and future leaves: index-backed, never built here.
 		out[neverBuiltIndexCanonical] = struct{}{}
 	}
 }
@@ -1179,6 +1212,12 @@ func matchAccountFilter(ls oracle.LedgerState, f *commonpb.QueryFilter, addr str
 		return false
 	case *commonpb.QueryFilter_AccountHasAsset:
 		return accountHasAsset(ls, addr, x.AccountHasAsset.GetAssetBase(), x.AccountHasAsset.GetPrecision())
+	case *commonpb.QueryFilter_Field:
+		return matchFieldCondition(ls.AccountFieldTypes(), func(key string) (*commonpb.MetadataValue, bool) {
+			v, ok := ls.Metadata()[oracle.MetaKey{Address: addr, Key: key}]
+
+			return v, ok
+		}, x.Field)
 	case *commonpb.QueryFilter_And:
 		return matchAll(x.And.GetFilters(), func(child *commonpb.QueryFilter) bool { return matchAccountFilter(ls, child, addr) })
 	case *commonpb.QueryFilter_Or:
@@ -1210,6 +1249,12 @@ func matchTxFilter(ls oracle.LedgerState, f *commonpb.QueryFilter, rec txRecordV
 		return rec.Reference() != "" && rec.Reference() == x.Reference.GetCond().GetHardcoded(), true
 	case *commonpb.QueryFilter_Address:
 		return matchTxAddress(ls, x.Address, rec), true
+	case *commonpb.QueryFilter_Field:
+		return matchFieldCondition(ls.TransactionFieldTypes(), func(key string) (*commonpb.MetadataValue, bool) {
+			v, ok := rec.Metadata()[key]
+
+			return v, ok
+		}, x.Field), true
 	case *commonpb.QueryFilter_BuiltinUint:
 		return matchTxBuiltinUint(x.BuiltinUint, rec)
 	case *commonpb.QueryFilter_And:

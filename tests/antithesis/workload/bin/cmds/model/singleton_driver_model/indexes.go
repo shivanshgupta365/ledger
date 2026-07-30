@@ -319,12 +319,34 @@ func rollIndexOp() bool {
 
 // generateIndexOp picks one workload index; creates it when the ledger lacks
 // it, else occasionally drops it (so the lifecycle keeps cycling) and otherwise
-// leaves it in place for queries to validate against. Reads committed state only.
+// leaves it in place for queries to validate against. One-in-16 it instead
+// probes CreateIndex on an UNDECLARED metadata field — rejected with
+// METADATA_FIELD_NOT_IN_SCHEMA, which the model predicts identically. Reads
+// committed state only.
 func generateIndexOp(g oracle.GlobalState, ledger string) *servicepb.Request {
+	if oneIn(16) {
+		return createIndexReq(ledger, indexes.MetadataID(
+			commonpb.TargetType_TARGET_TYPE_ACCOUNT, "undeclared-"+metaKey()))
+	}
+
+	ls := g.Ledger(ledger)
 	all := workloadIndexes()
+
+	// The declared metadata fields of both indexable targets join the pool, so
+	// metadata index lifecycles churn alongside the builtins.
+	for _, target := range []commonpb.TargetType{
+		commonpb.TargetType_TARGET_TYPE_ACCOUNT,
+		commonpb.TargetType_TARGET_TYPE_TRANSACTION,
+	} {
+		for key := range ls.FieldTypesFor(target) {
+			id := indexes.MetadataID(target, key)
+			all = append(all, workloadIndex{id, indexes.Canonical(id)})
+		}
+	}
+
 	pick := all[internal.Rand().Intn(len(all))]
 
-	exists, _ := g.Ledger(ledger).IndexState(pick.canonical)
+	exists, _ := ls.IndexState(pick.canonical)
 	if !exists {
 		return createIndexReq(ledger, pick.id)
 	}
@@ -466,7 +488,8 @@ func reconcileIndexes(ctx context.Context, c *Checker, conns internal.PerNodeCon
 // Any other error code is a finding, as are rows without every needed index and
 // a rejection when every needed index is active on every base.
 func (c *Checker) validateIndexedTransactionQuery(maxTicket uint64, ledger string, filter *commonpb.QueryFilter, needed map[string]struct{}, afterID uint64, pageSize int, reverse bool, serverTxs []*commonpb.Transaction, err error) {
-	if err != nil && status.Code(err) != codes.FailedPrecondition {
+	errKind, ok := classifyIndexedQueryError(err)
+	if !ok {
 		assert.Unreachable("singleton_driver_model: indexed transaction query returned unexpected error", internal.Details{
 			"ledger": ledger,
 			"filter": describeFilter(filter),
@@ -476,32 +499,17 @@ func (c *Checker) validateIndexedTransactionQuery(maxTicket uint64, ledger strin
 		return
 	}
 
-	gotResults := err == nil
-
 	if c.matchesModel(maxTicket, "TXQUERY-IDX", func(cand oracle.GlobalState) bool {
-		ls := cand.Ledger(ledger)
-
-		if !gotResults {
-			for canon := range needed {
-				if exists, active := ls.IndexState(canon); !exists || !active {
-					return true
-				}
-			}
-
-			return false
-		}
-
-		for canon := range needed {
-			if exists, _ := ls.IndexState(canon); !exists {
-				return false
-			}
-		}
-
-		return txWindowMatches(ls, filter, afterID, pageSize, reverse, serverTxs)
+		return indexedQueryOutcomeLegal(cand.Ledger(ledger), commonpb.QueryTarget_QUERY_TARGET_TRANSACTIONS, filter, needed, errKind, func(ls oracle.LedgerState) bool {
+			return txWindowMatches(ls, filter, afterID, pageSize, reverse, serverTxs)
+		})
 	}) {
-		if gotResults {
+		switch errKind {
+		case indexedErrNone:
 			assert.Reachable("singleton_driver_model: indexed transaction query served results", internal.Details{"ledger": ledger})
-		} else {
+		case indexedErrCompilation:
+			assert.Reachable("singleton_driver_model: kind-mismatched field query rejected", internal.Details{"ledger": ledger})
+		default:
 			assert.Reachable("singleton_driver_model: indexed transaction query gated", internal.Details{"ledger": ledger})
 		}
 
@@ -527,7 +535,7 @@ func (c *Checker) validateIndexedTransactionQuery(maxTicket uint64, ledger strin
 		"modelIdx": strings.Join(idxStates, " "),
 		"modelIds": joinUint64(modelWindow),
 	}
-	if gotResults {
+	if err == nil {
 		serverIds := make([]uint64, len(serverTxs))
 		for i, t := range serverTxs {
 			serverIds[i] = t.GetId()
@@ -539,4 +547,168 @@ func (c *Checker) validateIndexedTransactionQuery(maxTicket uint64, ledger strin
 	}
 
 	assert.Unreachable("singleton_driver_model: indexed transaction query outside model", details)
+}
+
+// metadataCanonical is the canonical IndexID of the per-(target, key) metadata
+// index serving Field conditions on the given query target.
+func metadataCanonical(target commonpb.QueryTarget, key string) string {
+	tt := commonpb.TargetType_TARGET_TYPE_ACCOUNT
+	if target == commonpb.QueryTarget_QUERY_TARGET_TRANSACTIONS {
+		tt = commonpb.TargetType_TARGET_TYPE_TRANSACTION
+	}
+
+	return indexes.Canonical(indexes.MetadataID(tt, key))
+}
+
+// indexedQueryOutcomeLegal is the shared per-candidate verdict for a query
+// whose filter needs indexes. The compiler's check order per Field leaf is
+// schema → requireIndexReady → kind coercion, so:
+//
+//   - a FailedPrecondition (index not found / not ready) is legal iff some
+//     needed index is not active on the base;
+//   - a FILTER_COMPILATION rejection (InvalidArgument) is legal iff the filter
+//     carries a kind-mismatched Field leaf under the base's declared types and
+//     every needed index exists (compilation reached the coercion check);
+//   - results are legal iff there is no kind mismatch, every needed index
+//     exists, and the window matches (windowMatches).
+func indexedQueryOutcomeLegal(
+	ls oracle.LedgerState,
+	target commonpb.QueryTarget,
+	filter *commonpb.QueryFilter,
+	needed map[string]struct{},
+	errKind indexedErrKind,
+	windowMatches func(oracle.LedgerState) bool,
+) bool {
+	switch errKind {
+	case indexedErrNotReady:
+		for canon := range needed {
+			if exists, active := ls.IndexState(canon); !exists || !active {
+				return true
+			}
+		}
+
+		return false
+	case indexedErrCompilation:
+		if !fieldKindMismatch(ls, filter, target) {
+			return false
+		}
+		for canon := range needed {
+			if exists, _ := ls.IndexState(canon); !exists {
+				return false
+			}
+		}
+
+		return true
+	default: // results
+		if fieldKindMismatch(ls, filter, target) {
+			return false
+		}
+		for canon := range needed {
+			if exists, _ := ls.IndexState(canon); !exists {
+				return false
+			}
+		}
+
+		return windowMatches(ls)
+	}
+}
+
+// indexedErrKind classifies the observed outcome of an index-backed query.
+type indexedErrKind int
+
+const (
+	indexedErrNone indexedErrKind = iota
+	indexedErrNotReady
+	indexedErrCompilation
+)
+
+// classifyIndexedQueryError buckets err for indexedQueryOutcomeLegal; ok=false
+// means the code is not part of the indexed-query surface at all (a finding).
+func classifyIndexedQueryError(err error) (indexedErrKind, bool) {
+	switch {
+	case err == nil:
+		return indexedErrNone, true
+	case status.Code(err) == codes.FailedPrecondition:
+		return indexedErrNotReady, true
+	case status.Code(err) == codes.InvalidArgument && internal.HasErrorReason(err, "FILTER_COMPILATION_ERROR"):
+		return indexedErrCompilation, true
+	default:
+		return indexedErrNone, false
+	}
+}
+
+// validateIndexedAccountQuery is the accounts twin of
+// validateIndexedTransactionQuery: same needed-set lifecycle gating, with the
+// ordered account window (accountWindow + accountMatches) as the result check.
+func (c *Checker) validateIndexedAccountQuery(maxTicket uint64, ledger string, filter *commonpb.QueryFilter, needed map[string]struct{}, cursor string, pageSize int, reverse bool, serverAccts []*commonpb.Account, err error) {
+	errKind, ok := classifyIndexedQueryError(err)
+	if !ok {
+		assert.Unreachable("singleton_driver_model: indexed account query returned unexpected error", internal.Details{
+			"ledger": ledger,
+			"filter": describeFilter(filter),
+			"error":  err.Error(),
+		})
+
+		return
+	}
+
+	if c.matchesModel(maxTicket, "AQUERY-IDX", func(cand oracle.GlobalState) bool {
+		return indexedQueryOutcomeLegal(cand.Ledger(ledger), commonpb.QueryTarget_QUERY_TARGET_ACCOUNTS, filter, needed, errKind, func(ls oracle.LedgerState) bool {
+			want := accountWindow(ls, filter, cursor, pageSize, reverse)
+			if len(want) != len(serverAccts) {
+				return false
+			}
+
+			for i, addr := range want {
+				if serverAccts[i].GetAddress() != addr || !accountMatches(ls, addr, serverAccts[i]) {
+					return false
+				}
+			}
+
+			return true
+		})
+	}) {
+		switch errKind {
+		case indexedErrNone:
+			assert.Reachable("singleton_driver_model: indexed account query served results", internal.Details{"ledger": ledger})
+		case indexedErrCompilation:
+			assert.Reachable("singleton_driver_model: kind-mismatched field query rejected", internal.Details{"ledger": ledger})
+		default:
+			assert.Reachable("singleton_driver_model: indexed account query gated", internal.Details{"ledger": ledger})
+		}
+
+		return
+	}
+
+	c.mu.Lock()
+	modelLS := c.modelState.Ledger(ledger)
+	idxStates := make([]string, 0, len(needed))
+	for canon := range needed {
+		exists, active := modelLS.IndexState(canon)
+		idxStates = append(idxStates, canon+"="+indexStateLabel(exists, active))
+	}
+	modelWindow := accountWindow(modelLS, filter, cursor, pageSize, reverse)
+	c.mu.Unlock()
+
+	details := internal.Details{
+		"ledger":     ledger,
+		"filter":     describeFilter(filter),
+		"cursor":     cursor,
+		"pageSize":   pageSize,
+		"reverse":    reverse,
+		"modelIdx":   strings.Join(idxStates, " "),
+		"modelAddrs": strings.Join(modelWindow, ","),
+	}
+	if err == nil {
+		serverAddrs := make([]string, len(serverAccts))
+		for i, a := range serverAccts {
+			serverAddrs[i] = a.GetAddress()
+		}
+		details["rows"] = len(serverAccts)
+		details["serverAddrs"] = strings.Join(serverAddrs, ",")
+	} else {
+		details["error"] = err.Error()
+	}
+
+	assert.Unreachable("singleton_driver_model: indexed account query outside model", details)
 }

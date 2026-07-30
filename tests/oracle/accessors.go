@@ -180,3 +180,10 @@ func (g GlobalState) LearnTxStamps(ledger string, id uint64, timestamp, inserted
 
 	ls.txs[id-1] = &rec
 }
+
+// FieldTypesFor returns the declared-type map for a metadata target — the
+// schema slice the generator consults for indexable fields. Read-only, like
+// the other map accessors.
+func (s LedgerState) FieldTypesFor(target commonpb.TargetType) map[string]commonpb.MetadataType {
+	return s.fieldTypes(target)
+}

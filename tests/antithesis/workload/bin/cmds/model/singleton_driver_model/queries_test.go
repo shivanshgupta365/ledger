@@ -5,6 +5,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/formancehq/ledger/v3/internal/domain/indexes"
 	"github.com/formancehq/ledger/v3/internal/proto/commonpb"
 	"github.com/formancehq/ledger/v3/internal/proto/servicepb"
 	"github.com/formancehq/ledger/v3/tests/oracle"
@@ -465,8 +466,110 @@ func TestNeededIndexCanonicals_AddressRoles(t *testing.T) {
 		{commonpb.AddressRole_ADDRESS_ROLE_DESTINATION, commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_DESTINATION_ADDRESS},
 	} {
 		needed := map[string]struct{}{}
-		neededIndexCanonicals(filterAddrPrefixRole("t-", tc.role), needed)
+		neededIndexCanonicals(filterAddrPrefixRole("t-", tc.role), txns, needed)
 		require.Len(t, needed, 1)
 		require.Contains(t, needed, txBuiltinCanonical(tc.builtin))
 	}
+}
+
+// --- Phase 3: metadata Field filters -----------------------------------------
+
+func TestOracle_MetadataIndexLifecycle(t *testing.T) {
+	t.Parallel()
+
+	acct := commonpb.TargetType_TARGET_TYPE_ACCOUNT
+	id := indexes.MetadataID(acct, "k1")
+	canonical := indexes.Canonical(id)
+
+	// CreateIndex on an undeclared field is rejected with the server's reason.
+	rejected := oracle.NewGlobalState().Apply(oracle.Bulk{Requests: []*servicepb.Request{
+		oracletest.CreateIndexReq(id),
+	}})
+	require.False(t, rejected.OK)
+	require.Equal(t, "METADATA_FIELD_NOT_IN_SCHEMA", rejected.Reason)
+
+	// Declared → create lands ambiguous; removing the declaration drops it.
+	declared := oracle.NewGlobalState().Apply(oracle.Bulk{Requests: []*servicepb.Request{
+		oracletest.SetFieldTypeReq(acct, "k1", commonpb.MetadataType_METADATA_TYPE_INT64),
+		oracletest.CreateIndexReq(id),
+	}})
+	require.True(t, declared.OK)
+	exists, active := declared.State.Ledger("L").IndexState(canonical)
+	require.True(t, exists)
+	require.False(t, active)
+
+	removed := declared.State.Apply(oracle.Bulk{Requests: []*servicepb.Request{
+		oracletest.RemoveFieldTypeReq(acct, "k1"),
+	}})
+	require.True(t, removed.OK)
+	exists, _ = removed.State.Ledger("L").IndexState(canonical)
+	require.False(t, exists)
+}
+
+func TestMatchFieldCondition_Coercion(t *testing.T) {
+	t.Parallel()
+
+	acct := commonpb.TargetType_TARGET_TYPE_ACCOUNT
+	str := func(s string) *commonpb.MetadataValue {
+		return &commonpb.MetadataValue{Type: &commonpb.MetadataValue_StringValue{StringValue: s}}
+	}
+
+	// k1 declared INT64; values stored verbatim: "5" coerces to 5, "junk" to
+	// null. k2 declared STRING holding an int value: coerces to its rendering.
+	gs := buildGlobal(t,
+		oracletest.SetFieldTypeReq(acct, "k1", commonpb.MetadataType_METADATA_TYPE_INT64),
+		oracletest.SetFieldTypeReq(acct, "k2", commonpb.MetadataType_METADATA_TYPE_STRING),
+		oracletest.TxReqL("L", "world", "a:1", "USD", 5),
+		oracletest.AddAccountMetaReq("a:1", "k1", str("5")),
+		oracletest.AddAccountMetaReq("a:1", "k2", &commonpb.MetadataValue{Type: &commonpb.MetadataValue_IntValue{IntValue: 7}}),
+		oracletest.TxReqL("L", "world", "a:2", "USD", 5),
+		oracletest.AddAccountMetaReq("a:2", "k1", str("junk")),
+	)
+	ls := gs.Ledger("L")
+
+	lo, hi := int64(1), int64(9)
+	intRange := filterFieldInt("k1", &lo, &hi).GetField()
+
+	lookup := func(addr string) func(string) (*commonpb.MetadataValue, bool) {
+		return func(key string) (*commonpb.MetadataValue, bool) {
+			v, ok := ls.Metadata()[oracle.MetaKey{Address: addr, Key: key}]
+
+			return v, ok
+		}
+	}
+
+	// "5" on an INT64 field coerces into range; "junk" coerces to null.
+	require.True(t, matchFieldCondition(ls.AccountFieldTypes(), lookup("a:1"), intRange))
+	require.False(t, matchFieldCondition(ls.AccountFieldTypes(), lookup("a:2"), intRange))
+
+	// Exists: null-coerced values are excluded unless include_null.
+	require.True(t, matchFieldCondition(ls.AccountFieldTypes(), lookup("a:1"), filterFieldExists("k1", false).GetField()))
+	require.False(t, matchFieldCondition(ls.AccountFieldTypes(), lookup("a:2"), filterFieldExists("k1", false).GetField()))
+	require.True(t, matchFieldCondition(ls.AccountFieldTypes(), lookup("a:2"), filterFieldExists("k1", true).GetField()))
+
+	// Int 7 on a STRING field coerces to its string rendering.
+	require.True(t, matchFieldCondition(ls.AccountFieldTypes(), lookup("a:1"), filterFieldString("k2", "7").GetField()))
+	require.False(t, matchFieldCondition(ls.AccountFieldTypes(), lookup("a:1"), filterFieldString("k2", "8").GetField()))
+
+	// Undeclared key or absent value never match.
+	require.False(t, matchFieldCondition(ls.AccountFieldTypes(), lookup("a:1"), filterFieldString("k9", "x").GetField()))
+	require.False(t, matchFieldCondition(ls.AccountFieldTypes(), lookup("world"), intRange))
+
+	// Kind mismatch classification: a string condition on the INT64 field.
+	require.True(t, fieldKindMismatch(ls, filterFieldString("k1", "x"), accounts))
+	require.False(t, fieldKindMismatch(ls, intRange2Filter(intRange), accounts))
+	require.False(t, fieldKindMismatch(ls, filterFieldString("k9", "x"), accounts), "undeclared is not a mismatch")
+
+	// Field-filtered account window: only a:1 matches the int range.
+	require.Equal(t, []string{"a:1"}, accountWindow(ls, intRange2Filter(intRange), "", 10, false))
+
+	// Needed-set classification per target.
+	needed := map[string]struct{}{}
+	neededIndexCanonicals(intRange2Filter(intRange), accounts, needed)
+	require.Contains(t, needed, metadataCanonical(accounts, "k1"))
+}
+
+// intRange2Filter rewraps a FieldCondition into a QueryFilter (test helper).
+func intRange2Filter(fc *commonpb.FieldCondition) *commonpb.QueryFilter {
+	return &commonpb.QueryFilter{Filter: &commonpb.QueryFilter_Field{Field: fc}}
 }

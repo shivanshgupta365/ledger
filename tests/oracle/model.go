@@ -1140,12 +1140,36 @@ func (s *LedgerState) applyDeleteLedgerMetadata(req *servicepb.DeleteLedgerMetad
 // server (a duplicate on a present index is a no-op, no AlreadyExists), so an
 // existing entry keeps its current readiness flag.
 func (s *LedgerState) applyCreateIndex(req *servicepb.CreateIndexRequest) OrderResult {
+	// A metadata index targets a declared schema field; creating one for an
+	// undeclared (target, key) is rejected (validateIndexTarget).
+	if meta, ok := req.GetId().GetKind().(*commonpb.IndexID_Metadata); ok {
+		if _, declared := s.fieldTypes(meta.Metadata.GetTarget())[meta.Metadata.GetKey()]; !declared {
+			return OrderResult{Reason: domain.ErrReasonMetadataFieldNotInSchema}
+		}
+	}
+
 	canonical := indexes.Canonical(req.GetId())
 	if _, exists := s.indexes[canonical]; !exists {
 		s.indexes[canonical] = false // ambiguous: created, readiness not yet confirmed
 	}
 
 	return OrderResult{OK: true}
+}
+
+// fieldTypes returns the declared-type map for a metadata target. Ledger-target
+// declarations exist but have no index surface; unknown targets are the empty
+// map (the caller treats every key as undeclared).
+func (s *LedgerState) fieldTypes(target commonpb.TargetType) map[string]commonpb.MetadataType {
+	switch target {
+	case commonpb.TargetType_TARGET_TYPE_ACCOUNT:
+		return s.accountFieldTypes
+	case commonpb.TargetType_TARGET_TYPE_LEDGER:
+		return s.ledgerFieldTypes
+	case commonpb.TargetType_TARGET_TYPE_TRANSACTION:
+		return s.transactionFieldTypes
+	default:
+		return nil
+	}
 }
 
 // applyDropIndex removes an index. Drop is instantaneous: once this order is in
@@ -1181,6 +1205,10 @@ func (s *LedgerState) applySetMetadataFieldType(req *servicepb.SetMetadataFieldT
 // applyRemoveMetadataFieldType drops a field's declared type. Stored values are
 // untouched; without a declared type, reads no longer coerce the key. Removing an
 // undeclared field is a no-op, matching the server. Always succeeds.
+//
+// A metadata index on the removed field cannot outlive its declaration — the
+// server drops it in the same order (the RemovedMetadataFieldType log carries
+// the DroppedIndex), so the model removes it too.
 func (s *LedgerState) applyRemoveMetadataFieldType(req *servicepb.RemoveMetadataFieldTypeRequest) OrderResult {
 	switch req.GetTargetType() {
 	case commonpb.TargetType_TARGET_TYPE_ACCOUNT:
@@ -1192,6 +1220,8 @@ func (s *LedgerState) applyRemoveMetadataFieldType(req *servicepb.RemoveMetadata
 	default:
 		panic(fmt.Sprintf("model: RemoveMetadataFieldType target %v is unmodeled", req.GetTargetType()))
 	}
+
+	delete(s.indexes, indexes.Canonical(indexes.MetadataID(req.GetTargetType(), req.GetKey())))
 
 	return OrderResult{OK: true}
 }

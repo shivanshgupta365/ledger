@@ -7,6 +7,7 @@ import (
 	"github.com/holiman/uint256"
 
 	"github.com/formancehq/ledger/v3/internal/domain"
+	"github.com/formancehq/ledger/v3/internal/domain/indexes"
 	"github.com/formancehq/ledger/v3/internal/proto/commonpb"
 	"github.com/formancehq/ledger/v3/internal/proto/servicepb"
 	"github.com/formancehq/ledger/v3/tests/oracle"
@@ -150,6 +151,11 @@ func (c *Checker) crossCheckCommit(bulk oracle.Bulk, resp *servicepb.ApplyRespon
 		}
 	}
 
+	// droppedInBulk collects the metadata-index canonicals earlier orders of
+	// THIS bulk already removed, so a duplicate remove-field-type correctly
+	// expects no second drop.
+	droppedInBulk := map[string]bool{}
+
 	// Check the remaining write ops against their response logs: the assigned
 	// transaction id and echoed reference/postings, and the schema / account-type
 	// mutations. These are all LedgerApplyOrders, so their logs sit under the
@@ -288,12 +294,33 @@ func (c *Checker) crossCheckCommit(bulk oracle.Bulk, resp *servicepb.ApplyRespon
 				return
 			}
 
-			// The workload never creates indexes, so removing a field type must
-			// never report dropping one.
-			if lg.GetDroppedIndex() != nil {
-				assert.Unreachable("singleton_driver_model: remove-field-type unexpectedly dropped an index", internal.Details{
-					"ledger": oracle.LedgerOf(req),
-					"key":    rq.GetKey(),
+			// A metadata index cannot outlive its field declaration: the server
+			// reports the dropped index on the log exactly when one existed.
+			// Compare against the pre-bulk model state, minus keys an earlier
+			// order of this bulk already removed (the second remove is a no-op).
+			canonical := indexes.Canonical(indexes.MetadataID(rq.GetTargetType(), rq.GetKey()))
+			hadIndex := false
+			if exists, _ := c.modelState.Ledger(oracle.LedgerOf(req)).IndexState(canonical); exists && !droppedInBulk[canonical] {
+				hadIndex = true
+			}
+			droppedInBulk[canonical] = true
+
+			if (lg.GetDroppedIndex() != nil) != hadIndex {
+				assert.Unreachable("singleton_driver_model: remove-field-type dropped-index mismatch", internal.Details{
+					"ledger":        oracle.LedgerOf(req),
+					"key":           rq.GetKey(),
+					"modelHadIdx":   hadIndex,
+					"serverDropped": lg.GetDroppedIndex() != nil,
+				})
+
+				return
+			}
+
+			if lg.GetDroppedIndex() != nil && indexes.Canonical(lg.GetDroppedIndex()) != canonical {
+				assert.Unreachable("singleton_driver_model: remove-field-type dropped wrong index", internal.Details{
+					"ledger":   oracle.LedgerOf(req),
+					"key":      rq.GetKey(),
+					"returned": indexes.Canonical(lg.GetDroppedIndex()),
 				})
 
 				return
