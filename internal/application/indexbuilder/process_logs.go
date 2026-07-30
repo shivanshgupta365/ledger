@@ -808,6 +808,18 @@ func (b *Builder) indexPostingAddressMappings(
 	sourceExcluded := isExcluded(excludedVolumes, source, asset, color)
 	destinationExcluded := isExcluded(excludedVolumes, destination, asset, color)
 
+	// Exclusion skips are rare (a purged/transient touch) and each one silently
+	// shapes the posting-derived indexes, so log every decision for diagnosis.
+	if sourceExcluded || destinationExcluded {
+		b.logger.WithFields(map[string]any{
+			"ledger": ledger,
+			"txID":   txID,
+			"source": source, "sourceExcluded": sourceExcluded,
+			"destination": destination, "destinationExcluded": destinationExcluded,
+			"asset": asset,
+		}).Infof("Posting-index exclusion skip")
+	}
+
 	// Account has-asset index: record every (account, assetBase, precision) a
 	// posting touches, for both source and destination, skipping excluded
 	// (transient/purged) volumes. Routed through the shared posting walk so

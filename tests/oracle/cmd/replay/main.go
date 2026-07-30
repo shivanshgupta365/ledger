@@ -148,6 +148,14 @@ func replayCommitted(batches []batch, target string) {
 	traceType := os.Getenv("MODEL_TRACE_TYPE")
 	traceAcct := os.Getenv("MODEL_TRACE_ACCOUNT")
 
+	// MODEL_TRACE_TX=N: log every CreateIndex/DropIndex on the target ledger,
+	// the bulk that committed transaction N, and — at the end — the folded
+	// record's postings and account→tx index membership.
+	var traceTx uint64
+	if s := os.Getenv("MODEL_TRACE_TX"); s != "" {
+		traceTx, _ = strconv.ParseUint(s, 10, 64)
+	}
+
 	gs := oracle.NewGlobalState()
 	touched := map[string]bool{}
 	rejected := 0
@@ -201,6 +209,24 @@ func replayCommitted(batches []batch, target string) {
 			}
 		}
 
+		var preTxCount int
+		if traceTx > 0 && target != "" {
+			preTxCount = len(gs.Ledger(target).Txs())
+
+			for _, r := range bulk.Requests {
+				switch x := r.GetType().(type) {
+				case *servicepb.Request_CreateIndex:
+					if x.CreateIndex.GetLedger() == target {
+						fmt.Printf("seq=%-6d CREATE-INDEX %v\n", b.seq, x.CreateIndex.GetId())
+					}
+				case *servicepb.Request_DropIndex:
+					if x.DropIndex.GetLedger() == target {
+						fmt.Printf("seq=%-6d DROP-INDEX   %v\n", b.seq, x.DropIndex.GetId())
+					}
+				}
+			}
+		}
+
 		res := gs.Apply(bulk)
 		if !res.OK {
 			rejected++
@@ -209,6 +235,13 @@ func replayCommitted(batches []batch, target string) {
 			continue
 		}
 		gs = res.State
+
+		if traceTx > 0 && target != "" {
+			post := len(gs.Ledger(target).Txs())
+			if uint64(preTxCount) < traceTx && uint64(post) >= traceTx {
+				fmt.Printf("seq=%-6d TX %d COMMITTED (bulk kinds=%s postings=%s)\n", b.seq, traceTx, renderKinds(bulk), renderPostings(bulk))
+			}
+		}
 
 		// Per-bulk account trace: any committed bulk whose postings touch the
 		// traced account prints the account's cells right after apply, plus
@@ -276,6 +309,19 @@ func replayCommitted(batches []batch, target string) {
 		if hitsTarget {
 			ls := gs.Ledger(target)
 			fmt.Printf("seq=%-6d %s meta=%s types=%d\n", b.seq, target, renderMeta(ls.LedgerMeta()), len(ls.Types()))
+		}
+	}
+
+	if traceTx > 0 && target != "" {
+		txs := gs.Ledger(target).Txs()
+		if traceTx <= uint64(len(txs)) {
+			rec := txs[traceTx-1]
+			fmt.Printf("\nTX %d: ref=%q reverted=%v postings=%v\n", traceTx, rec.Reference(), rec.Reverted(), rec.Postings())
+			fmt.Printf("TX %d indexedAddrs: ", traceTx)
+			for addr, bits := range rec.IndexedAddrs() {
+				fmt.Printf("%s=%02b ", addr, bits)
+			}
+			fmt.Println()
 		}
 	}
 
