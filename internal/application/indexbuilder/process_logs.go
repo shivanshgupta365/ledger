@@ -810,7 +810,7 @@ func (b *Builder) indexPostingAddressMappings(
 
 	// Exclusion skips are rare (a purged/transient touch) and each one silently
 	// shapes the posting-derived indexes, so log every decision for diagnosis.
-	if sourceExcluded || destinationExcluded {
+	if (sourceExcluded || destinationExcluded) && b.logger != nil {
 		b.logger.WithFields(map[string]any{
 			"ledger": ledger,
 			"txID":   txID,
