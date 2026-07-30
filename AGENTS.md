@@ -73,9 +73,9 @@ Interfaces with mockgen: `Transport` (`internal/infra/node/transport.go`), `Cont
 
 ## Protocol Buffers
 
-**CRITICAL**: After modifying any `.proto` file, **immediately** run `just generate-proto`. Realign field numbers sequentially when adding/removing fields.
+**CRITICAL**: After modifying any `.proto` file, **immediately** run `just generate-proto`. Realign field numbers sequentially when adding/removing fields — **except when removing a field that already shipped from a persisted or Raft-replicated message** (anything under `Proposal`, or stored in Pebble). There you MUST `reserved` the retired tag and name and leave every surviving field on its original tag: renumbering shifts the survivors and changes their wire types, so a peer on another binary version fails to decode — or mis-decodes — an entry its peers applied, breaking the deterministic-FSM invariant (#2). The storage-schema-version gate does not cover this; it gates opening a store, not live wire traffic.
 
-See [docs/technical/contributing/protobuf.md](docs/technical/contributing/protobuf.md) for full details (file locations, vtprotobuf, Uint256 wire format, adding new command models).
+See [docs/technical/contributing/protobuf.md](docs/technical/contributing/protobuf.md) for full details (file locations, vtprotobuf, Uint256 wire format, adding new command models, and the reserve-vs-renumber rule).
 
 ## Conventions
 

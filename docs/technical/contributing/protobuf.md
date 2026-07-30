@@ -60,10 +60,41 @@ go install github.com/planetscale/vtprotobuf/cmd/protoc-gen-go-vtproto@v0.6.1-0.
 ## Modifying Protocol Definitions
 
 1. Edit the `.proto` file in `misc/proto/`
-2. **Realign field numbers sequentially** when adding/removing fields (no gaps, remove obsolete `reserved` entries)
+2. **Realign field numbers sequentially** when adding/removing fields (no gaps, remove obsolete `reserved` entries) — **but only for messages that never reach the wire in a shipped build**. See [Removing a field](#removing-a-field) below before renumbering anything.
 3. Run `just generate-proto` **immediately**
 4. Update Go code that uses the generated types
 5. Rebuild: `go build ./...`
+
+### Removing a field
+
+Whether you may renumber the surviving fields depends on one question: **did the
+removed field ever ship on the wire?**
+
+| Situation | What to do |
+|-----------|------------|
+| The field exists only in an unmerged PR — no released build ever encoded it | Renumber freely, no gaps. |
+| The field shipped in a released build **and** the message is persisted (Pebble values, snapshots) or replicated (anything under a Raft `Proposal`) | `reserved <tag>;` + `reserved "<name>";`, and **keep every surviving field on its original tag**. |
+
+Renumbering a shipped, replicated message is a correctness bug, not a style
+choice. Tags are positional: dropping one shifts each survivor down, which
+usually also changes its wire type. Two binaries on different versions then
+disagree about what tag 2 means, so a node either hard-fails to decode an entry
+its peers applied, or decodes it into different state — divergence, and a
+violation of the deterministic-FSM invariant (`AGENTS.md` invariant #2). The
+storage-schema-version gate does **not** cover this: it refuses to open an
+incompatible *store*, but a peer already running an older binary keeps sending
+live entries.
+
+Both branches of the rule are already exercised in `misc/proto/raft_cmd.proto`:
+
+- **Reserved** — `Order` (1, 4, 6), `Proposal` (5, 6, 8–13), `TechnicalUpdate`
+  (8), `BackupOrder` (2), `MirrorSyncUpdate` (2). `Proposal.caller` carries the
+  canonical note: *"Keep 13 reserved forever and write the new snapshot at 14."*
+- **Renumbered** — `BackupState` field 8, explicitly justified as safe *"because
+  nothing on the wire carried it during the unmerged PR."*
+
+When in doubt, reserve. A permanently burned tag costs nothing; a renumbered
+one costs a cluster.
 
 ## vtprotobuf (Fast Serialization)
 
