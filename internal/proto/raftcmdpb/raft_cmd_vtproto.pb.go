@@ -10792,7 +10792,7 @@ func (m *MirrorSyncUpdate) MarshalToSizedBufferVT(dAtA []byte) (int, error) {
 		i -= 8
 		binary.LittleEndian.PutUint64(dAtA[i:], uint64(m.SourceLogCount))
 		i--
-		dAtA[i] = 0x21
+		dAtA[i] = 0x29
 	}
 	if m.ClearError {
 		i--
@@ -10802,7 +10802,7 @@ func (m *MirrorSyncUpdate) MarshalToSizedBufferVT(dAtA []byte) (int, error) {
 			dAtA[i] = 0
 		}
 		i--
-		dAtA[i] = 0x18
+		dAtA[i] = 0x20
 	}
 	if m.Error != nil {
 		size, err := m.Error.MarshalToSizedBufferVT(dAtA[:i])
@@ -10812,7 +10812,7 @@ func (m *MirrorSyncUpdate) MarshalToSizedBufferVT(dAtA []byte) (int, error) {
 		i -= size
 		i = protohelpers.EncodeVarint(dAtA, i, uint64(size))
 		i--
-		dAtA[i] = 0x12
+		dAtA[i] = 0x1a
 	}
 	if len(m.LedgerName) > 0 {
 		i -= len(m.LedgerName)
@@ -25033,7 +25033,7 @@ func (m *MirrorSyncUpdate) UnmarshalVT(dAtA []byte) error {
 			}
 			m.LedgerName = string(dAtA[iNdEx:postIndex])
 			iNdEx = postIndex
-		case 2:
+		case 3:
 			if wireType != 2 {
 				return fmt.Errorf("proto: wrong wireType = %d for field Error", wireType)
 			}
@@ -25069,7 +25069,7 @@ func (m *MirrorSyncUpdate) UnmarshalVT(dAtA []byte) error {
 				return err
 			}
 			iNdEx = postIndex
-		case 3:
+		case 4:
 			if wireType != 0 {
 				return fmt.Errorf("proto: wrong wireType = %d for field ClearError", wireType)
 			}
@@ -25089,7 +25089,7 @@ func (m *MirrorSyncUpdate) UnmarshalVT(dAtA []byte) error {
 				}
 			}
 			m.ClearError = bool(v != 0)
-		case 4:
+		case 5:
 			if wireType != 1 {
 				return fmt.Errorf("proto: wrong wireType = %d for field SourceLogCount", wireType)
 			}

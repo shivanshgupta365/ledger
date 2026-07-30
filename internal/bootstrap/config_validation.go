@@ -23,12 +23,15 @@ import (
 //
 // v3: mirror ingestion position consolidation (EN-1513). The per-ledger
 // MirrorCursor row (ZonePerLedger / sub 0x05) was removed in favour of
-// LedgerBoundaries.last_mirror_v2_log_id, and MirrorSyncUpdate's field tags
-// were realigned. Refusing a v2 store guarantees no un-applied Raft WAL entry
-// carrying the old tag layout is ever replayed against the new one. The bump
-// also retroactively gates the EN-1550 last_mirror_v2_log_id field itself:
-// v2 predates it, and compareMirrorV2LogID requires it with no backfill
-// leniency.
+// LedgerBoundaries.last_mirror_v2_log_id, so a v2 store carries an ingestion
+// position this binary no longer reads. The bump also retroactively gates the
+// EN-1550 last_mirror_v2_log_id field itself: v2 predates it, and
+// compareMirrorV2LogID requires it with no backfill leniency.
+//
+// Note this gate covers the *store*, not the wire: it stops a v2 store from
+// being opened, but it cannot stop a peer running another binary from sending
+// live Raft entries. That is why MirrorSyncUpdate reserves the retired cursor
+// tag instead of realigning the survivors — see misc/proto/raft_cmd.proto.
 const CurrentStorageSchemaVersion uint32 = 3
 
 // SchemaVersionError is returned when the persisted storage schema version is

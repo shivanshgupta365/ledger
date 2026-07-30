@@ -707,9 +707,24 @@ message IdempotencyEviction {
 // authority for the applied position (EN-1513).
 message MirrorSyncUpdate {
   string ledger_name = 1;
-  common.MirrorSyncError error = 2;
-  bool clear_error = 3;
-  fixed64 source_log_count = 4;  // Latest known log ID in v2 source
+  // Field 2 previously held `fixed64 cursor`, the mirror ingestion position.
+  // The position now lives solely in LedgerBoundaries.last_mirror_v2_log_id,
+  // advanced by the order-apply path (EN-1513).
+  //
+  // Reserved, NOT renumbered: this message rides the Raft log (inside
+  // TechnicalUpdate.mirror_sync) and the cursor field shipped, so old entries
+  // carrying it exist on real clusters. Realigning the survivors down would
+  // change every remaining tag's wire type (fixed64 -> message at 2, message
+  // -> bool at 3, bool -> fixed64 at 4), so a node running the other version
+  // would hard-fail to decode an entry its peers applied — divergence, per
+  // the deterministic-FSM invariant. Same rule as Proposal.caller (13) and
+  // TechnicalUpdate.index_ready (8); contrast BackupState field 8, which was
+  // renumbered only because nothing on the wire ever carried it.
+  reserved 2;
+  reserved "cursor";
+  common.MirrorSyncError error = 3;
+  bool clear_error = 4;
+  fixed64 source_log_count = 5;  // Latest known log ID in v2 source
 }
 
 // EventsSinkUpdate carries a per-sink cursor advance or error status change.
