@@ -709,6 +709,14 @@ const (
 	ErrorReason_ERROR_REASON_PRELOAD_UNAVAILABLE ErrorReason = 67
 	ErrorReason_ERROR_REASON_AGGREGATE_OVERFLOW  ErrorReason = 68
 	ErrorReason_ERROR_REASON_BALANCE_NOT_FOUND   ErrorReason = 69
+	// ERROR_REASON_CHECKPOINT_LIMIT_REACHED: a CreateQueryCheckpoint order was
+	// rejected because the cluster already holds the maximum number of live
+	// query checkpoints. Maps to gRPC ResourceExhausted / HTTP 429; delete an
+	// existing checkpoint before creating another.
+	ErrorReason_ERROR_REASON_CHECKPOINT_LIMIT_REACHED ErrorReason = 70
+	// ERROR_REASON_CHECKPOINT_NOT_FOUND: a DeleteQueryCheckpoint order targeted
+	// a checkpoint ID that is not live. Maps to gRPC NotFound / HTTP 404.
+	ErrorReason_ERROR_REASON_CHECKPOINT_NOT_FOUND ErrorReason = 71
 )
 
 // Enum value maps for ErrorReason.
@@ -783,6 +791,8 @@ var (
 		67: "ERROR_REASON_PRELOAD_UNAVAILABLE",
 		68: "ERROR_REASON_AGGREGATE_OVERFLOW",
 		69: "ERROR_REASON_BALANCE_NOT_FOUND",
+		70: "ERROR_REASON_CHECKPOINT_LIMIT_REACHED",
+		71: "ERROR_REASON_CHECKPOINT_NOT_FOUND",
 	}
 	ErrorReason_value = map[string]int32{
 		"ERROR_REASON_UNSPECIFIED":                      0,
@@ -854,6 +864,8 @@ var (
 		"ERROR_REASON_PRELOAD_UNAVAILABLE":              67,
 		"ERROR_REASON_AGGREGATE_OVERFLOW":               68,
 		"ERROR_REASON_BALANCE_NOT_FOUND":                69,
+		"ERROR_REASON_CHECKPOINT_LIMIT_REACHED":         70,
+		"ERROR_REASON_CHECKPOINT_NOT_FOUND":             71,
 	}
 )
 
@@ -13772,7 +13784,7 @@ const file_common_proto_rawDesc = "" +
 	"\x12LEDGER_MODE_MIRROR\x10\x01*Q\n" +
 	"\x0fMirrorSyncState\x12\x1d\n" +
 	"\x19MIRROR_SYNC_STATE_SYNCING\x10\x00\x12\x1f\n" +
-	"\x1bMIRROR_SYNC_STATE_FOLLOWING\x10\x01*\xbf\x15\n" +
+	"\x1bMIRROR_SYNC_STATE_FOLLOWING\x10\x01*\x91\x16\n" +
 	"\vErrorReason\x12\x1c\n" +
 	"\x18ERROR_REASON_UNSPECIFIED\x10\x00\x12&\n" +
 	"\"ERROR_REASON_LEDGER_ALREADY_EXISTS\x10\x01\x12!\n" +
@@ -13843,7 +13855,9 @@ const file_common_proto_rawDesc = "" +
 	"$ERROR_REASON_STALE_INPUTS_RESOLUTION\x10B\x12$\n" +
 	" ERROR_REASON_PRELOAD_UNAVAILABLE\x10C\x12#\n" +
 	"\x1fERROR_REASON_AGGREGATE_OVERFLOW\x10D\x12\"\n" +
-	"\x1eERROR_REASON_BALANCE_NOT_FOUND\x10E*Q\n" +
+	"\x1eERROR_REASON_BALANCE_NOT_FOUND\x10E\x12)\n" +
+	"%ERROR_REASON_CHECKPOINT_LIMIT_REACHED\x10F\x12%\n" +
+	"!ERROR_REASON_CHECKPOINT_NOT_FOUND\x10G*Q\n" +
 	"\x14ChartEnforcementMode\x12\x1c\n" +
 	"\x18CHART_ENFORCEMENT_STRICT\x10\x00\x12\x1b\n" +
 	"\x17CHART_ENFORCEMENT_AUDIT\x10\x01*i\n" +

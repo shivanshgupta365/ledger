@@ -38,6 +38,13 @@ type FSMState struct {
 	QueryCheckpointSchedule string
 	PendingLedgerCleanups   map[string]uint64
 
+	// LiveQueryCheckpointIDs is the set of query-checkpoint IDs currently live
+	// in the store, rehydrated at recovery from the SubGlobQueryCheckpoint rows.
+	// The FSM reads it to enforce the fixed cap on CreateQueryCheckpoint and to
+	// reject DeleteQueryCheckpoint for a non-live ID — deterministically and
+	// without a Pebble scan on the apply path (invariant #3).
+	LiveQueryCheckpointIDs map[uint64]struct{}
+
 	// Last cluster config applied + derived hash generator. Persisted under
 	// ZoneGlobal so it survives restarts.
 	LastClusterConfig *commonpb.ClusterConfig
@@ -59,12 +66,13 @@ type FSMState struct {
 // initial values; the map is allocated empty.
 func NewFSMState(clusterID string) *FSMState {
 	return &FSMState{
-		NextSequenceID:        1,
-		NextAuditSequenceID:   1,
-		NextLedgerID:          1,
-		PendingLedgerCleanups: map[string]uint64{},
-		HashGenerator:         processing.NewHashGenerator(commonpb.HashAlgorithm_HASH_ALGORITHM_BLAKE3, clusterID),
-		ClusterID:             clusterID,
+		NextSequenceID:         1,
+		NextAuditSequenceID:    1,
+		NextLedgerID:           1,
+		PendingLedgerCleanups:  map[string]uint64{},
+		LiveQueryCheckpointIDs: map[uint64]struct{}{},
+		HashGenerator:          processing.NewHashGenerator(commonpb.HashAlgorithm_HASH_ALGORITHM_BLAKE3, clusterID),
+		ClusterID:              clusterID,
 	}
 }
 
@@ -156,6 +164,13 @@ func LoadFSMStateFromStore(reader dal.RecoveryReader, handle *dal.ReadHandle, cl
 	}
 
 	s.NextQueryCheckpointID = nextQCPID
+
+	liveQCPIDs, err := query.ReadLiveQueryCheckpointIDs(handle)
+	if err != nil {
+		return nil, fmt.Errorf("reading live query checkpoint IDs: %w", err)
+	}
+
+	s.LiveQueryCheckpointIDs = liveQCPIDs
 
 	qcpSchedule, err := query.ReadQueryCheckpointSchedule(reader)
 	if err != nil {

@@ -1275,6 +1275,82 @@ func (c *MockScopePutRevertedCall) DoAndReturn(f func(domain.TransactionKey, boo
 	return c
 }
 
+// QueryCheckpointCount mocks base method.
+func (m *MockScope) QueryCheckpointCount() int {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "QueryCheckpointCount")
+	ret0, _ := ret[0].(int)
+	return ret0
+}
+
+// QueryCheckpointCount indicates an expected call of QueryCheckpointCount.
+func (mr *MockScopeMockRecorder) QueryCheckpointCount() *MockScopeQueryCheckpointCountCall {
+	mr.mock.ctrl.T.Helper()
+	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "QueryCheckpointCount", reflect.TypeOf((*MockScope)(nil).QueryCheckpointCount))
+	return &MockScopeQueryCheckpointCountCall{Call: call}
+}
+
+// MockScopeQueryCheckpointCountCall wrap *gomock.Call
+type MockScopeQueryCheckpointCountCall struct {
+	*gomock.Call
+}
+
+// Return rewrite *gomock.Call.Return
+func (c *MockScopeQueryCheckpointCountCall) Return(arg0 int) *MockScopeQueryCheckpointCountCall {
+	c.Call = c.Call.Return(arg0)
+	return c
+}
+
+// Do rewrite *gomock.Call.Do
+func (c *MockScopeQueryCheckpointCountCall) Do(f func() int) *MockScopeQueryCheckpointCountCall {
+	c.Call = c.Call.Do(f)
+	return c
+}
+
+// DoAndReturn rewrite *gomock.Call.DoAndReturn
+func (c *MockScopeQueryCheckpointCountCall) DoAndReturn(f func() int) *MockScopeQueryCheckpointCountCall {
+	c.Call = c.Call.DoAndReturn(f)
+	return c
+}
+
+// QueryCheckpointExists mocks base method.
+func (m *MockScope) QueryCheckpointExists(checkpointID uint64) bool {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "QueryCheckpointExists", checkpointID)
+	ret0, _ := ret[0].(bool)
+	return ret0
+}
+
+// QueryCheckpointExists indicates an expected call of QueryCheckpointExists.
+func (mr *MockScopeMockRecorder) QueryCheckpointExists(checkpointID any) *MockScopeQueryCheckpointExistsCall {
+	mr.mock.ctrl.T.Helper()
+	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "QueryCheckpointExists", reflect.TypeOf((*MockScope)(nil).QueryCheckpointExists), checkpointID)
+	return &MockScopeQueryCheckpointExistsCall{Call: call}
+}
+
+// MockScopeQueryCheckpointExistsCall wrap *gomock.Call
+type MockScopeQueryCheckpointExistsCall struct {
+	*gomock.Call
+}
+
+// Return rewrite *gomock.Call.Return
+func (c *MockScopeQueryCheckpointExistsCall) Return(arg0 bool) *MockScopeQueryCheckpointExistsCall {
+	c.Call = c.Call.Return(arg0)
+	return c
+}
+
+// Do rewrite *gomock.Call.Do
+func (c *MockScopeQueryCheckpointExistsCall) Do(f func(uint64) bool) *MockScopeQueryCheckpointExistsCall {
+	c.Call = c.Call.Do(f)
+	return c
+}
+
+// DoAndReturn rewrite *gomock.Call.DoAndReturn
+func (c *MockScopeQueryCheckpointExistsCall) DoAndReturn(f func(uint64) bool) *MockScopeQueryCheckpointExistsCall {
+	c.Call = c.Call.DoAndReturn(f)
+	return c
+}
+
 // RemoveClosingChapter mocks base method.
 func (m *MockScope) RemoveClosingChapter(chapterID uint64) {
 	m.ctrl.T.Helper()

@@ -302,6 +302,14 @@ func (c *Checker) Check(ctx context.Context, callback func(*servicepb.CheckStore
 		// SubAttrNumscriptVersion (latest pointer = greatest stored semver).
 		expectedNumscriptContent = make(map[domain.NumscriptEntryKey]*commonpb.NumscriptInfo)
 		expectedNumscriptLatest  = make(map[domain.NumscriptVersionKey]string)
+
+		// derivedLiveCheckpoints is the audit-derived set of live query-checkpoint
+		// IDs (cluster-global): a CreatedQueryCheckpoint with no later
+		// DeletedQueryCheckpoint. Seeded from the baseline under archiving (the
+		// create logs are purged with the chapter), then advanced by the replayed
+		// create/delete logs. compareQueryCheckpoints checks every stored row is a
+		// member.
+		derivedLiveCheckpoints = make(map[uint64]struct{})
 	)
 
 	// excluded is built incrementally as SimulateEphemeralPurge decides to
@@ -376,6 +384,13 @@ func (c *Checker) Check(ctx context.Context, callback func(*servicepb.CheckStore
 		// does not make the checker expect a lower latest than the store holds,
 		// and archived immutable content stays verified.
 		if err := c.foldBaselineNumscripts(baselineDB, expectedNumscriptContent, expectedNumscriptLatest); err != nil {
+			return err
+		}
+
+		// Seed the live query-checkpoint set from the baseline: the pre-archive
+		// CreatedQueryCheckpoint logs are purged with the archived chapter, so
+		// replay alone would under-derive the set and false-flag live rows.
+		if err := c.foldBaselineQueryCheckpoints(baselineDB, derivedLiveCheckpoints); err != nil {
 			return err
 		}
 
@@ -514,6 +529,14 @@ func (c *Checker) Check(ctx context.Context, callback func(*servicepb.CheckStore
 					if cur, ok := expectedNumscriptLatest[vk]; !ok || numscriptVersionGreater(info.GetVersion(), cur) {
 						expectedNumscriptLatest[vk] = info.GetVersion()
 					}
+				}
+			case *commonpb.LogPayload_CreatedQueryCheckpoint:
+				if cp := payload.CreatedQueryCheckpoint; cp != nil {
+					derivedLiveCheckpoints[cp.GetCheckpointId()] = struct{}{}
+				}
+			case *commonpb.LogPayload_DeletedQueryCheckpoint:
+				if cp := payload.DeletedQueryCheckpoint; cp != nil {
+					delete(derivedLiveCheckpoints, cp.GetCheckpointId())
 				}
 			case *commonpb.LogPayload_Apply:
 				if payload.Apply != nil {
@@ -745,6 +768,10 @@ func (c *Checker) Check(ctx context.Context, callback func(*servicepb.CheckStore
 	}
 
 	c.compareNumscripts(snap, expectedNumscriptContent, expectedNumscriptLatest, deletedInReplay, pendingCleanupLedgers, callback)
+
+	if err := c.compareQueryCheckpoints(snap, derivedLiveCheckpoints, callback); err != nil {
+		return err
+	}
 
 	return nil
 }
@@ -1134,6 +1161,59 @@ func (c *Checker) compareMirrorV2LogID(reader dal.PebbleReader, chainBound *chai
 				0, name, "", ""))
 		}
 	}
+}
+
+// compareQueryCheckpoints verifies that every live query-checkpoint row stored
+// in the primary store (ZoneGlobal/SubGlobQueryCheckpoint) is justified by the
+// audit chain. `derived` is the live set re-derived from the CreatedQueryCheckpoint
+// / DeletedQueryCheckpoint logs (baseline-seeded under archiving); any stored id
+// absent from it is a phantom, tampered, or should-have-been-deleted row and
+// emits CHECK_STORE_ERROR_TYPE_QUERY_CHECKPOINT_MISMATCH.
+//
+// Only the stored ⊆ derived direction is checked. The reverse — an audited-live
+// checkpoint with no stored row — is intentionally not flagged: query-checkpoint
+// rows are deliberately not rebuilt on restore (they degrade to NotFound and are
+// recreated by the operator), so a missing row is a legitimate post-restore
+// state, not corruption.
+func (c *Checker) compareQueryCheckpoints(reader dal.PebbleReader, derived map[uint64]struct{}, callback func(*servicepb.CheckStoreEvent)) error {
+	stored, err := query.ReadLiveQueryCheckpointIDs(reader)
+	if err != nil {
+		return fmt.Errorf("reading stored query checkpoints: %w", err)
+	}
+
+	ids := make([]uint64, 0, len(stored))
+	for id := range stored {
+		ids = append(ids, id)
+	}
+
+	slices.Sort(ids)
+
+	for _, id := range ids {
+		if _, ok := derived[id]; !ok {
+			callback(errorEvent(
+				servicepb.CheckStoreErrorType_CHECK_STORE_ERROR_TYPE_QUERY_CHECKPOINT_MISMATCH,
+				fmt.Sprintf("stored query checkpoint %d is not justified by the audit chain (no CreatedQueryCheckpoint, or a later DeletedQueryCheckpoint)", id),
+				0, "", "", ""))
+		}
+	}
+
+	return nil
+}
+
+// foldBaselineQueryCheckpoints seeds the audit-derived live-checkpoint set from
+// the boundary-time baseline, whose SubGlobQueryCheckpoint rows stand in for the
+// pre-archive CreatedQueryCheckpoint logs purged with the archived chapter.
+func (c *Checker) foldBaselineQueryCheckpoints(baselineDB *pebble.DB, into map[uint64]struct{}) error {
+	ids, err := query.ReadLiveQueryCheckpointIDs(baselineDB)
+	if err != nil {
+		return fmt.Errorf("folding baseline query checkpoints: %w", err)
+	}
+
+	for id := range ids {
+		into[id] = struct{}{}
+	}
+
+	return nil
 }
 
 // numscriptVersionGreater reports whether a is a strictly greater full semver

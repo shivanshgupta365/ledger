@@ -125,6 +125,14 @@ type WriteSet struct {
 	pendingQueryCheckpointSaves   []*raftcmdpb.QueryCheckpointState
 	pendingQueryCheckpointDeletes []uint64
 
+	// liveQueryCheckpoints is a per-proposal overlay of the live checkpoint-ID
+	// set (FSMState.LiveQueryCheckpointIDs), copied lazily on the first
+	// checkpoint operation so proposals that touch no checkpoints pay nothing.
+	// The FSM reads it (QueryCheckpointCount / QueryCheckpointExists) to gate
+	// CreateQueryCheckpoint against the fixed cap and to make deletes
+	// existence-aware; Merge swaps it back into FSMState on commit.
+	liveQueryCheckpoints map[uint64]struct{}
+
 	// chapterClosing is true when a processor emitted at least one
 	// CloseChapter intent during this proposal. applyProposal reads it
 	// (via ChapterClosing) AFTER the audit entry is written so the
@@ -821,6 +829,13 @@ func (b *WriteSet) Merge(batch *dal.WriteSession, logsOrRefs []*raftcmdpb.Create
 	b.fsm.State.NextLedgerID = b.NextLedgerID
 	b.fsm.State.NextQueryCheckpointID = b.NextQueryCheckpointID
 
+	// The overlay is non-nil only when this proposal created or deleted a
+	// checkpoint; swap it in as the new committed live set (its Pebble rows
+	// were persisted above).
+	if b.liveQueryCheckpoints != nil {
+		b.fsm.State.LiveQueryCheckpointIDs = b.liveQueryCheckpoints
+	}
+
 	// Apply changed chapters to Machine's Chapters tracker.
 	for _, p := range b.changedChapters {
 		b.fsm.Chapters.PutChapter(p)
@@ -900,6 +915,7 @@ func (b *WriteSet) Reset(at *commonpb.Timestamp) {
 	b.bloomUpdates.Reset()
 	b.pendingQueryCheckpointSaves = b.pendingQueryCheckpointSaves[:0]
 	b.pendingQueryCheckpointDeletes = b.pendingQueryCheckpointDeletes[:0]
+	b.liveQueryCheckpoints = nil
 	b.chapterClosing = false
 	b.mirrorConfigChanged = false
 	b.queryCheckpointCreated = 0
@@ -1712,11 +1728,47 @@ func (b *WriteSet) IncrementNextQueryCheckpointID() uint64 {
 // SaveQueryCheckpoint stores a query checkpoint for Merge.
 func (b *WriteSet) SaveQueryCheckpoint(cp *raftcmdpb.QueryCheckpointState) {
 	b.pendingQueryCheckpointSaves = append(b.pendingQueryCheckpointSaves, cp)
+	b.ensureLiveQueryCheckpoints()
+	b.liveQueryCheckpoints[cp.GetCheckpointId()] = struct{}{}
 }
 
 // DeleteQueryCheckpoint marks a query checkpoint for deletion during Merge.
 func (b *WriteSet) DeleteQueryCheckpoint(checkpointID uint64) {
 	b.pendingQueryCheckpointDeletes = append(b.pendingQueryCheckpointDeletes, checkpointID)
+	b.ensureLiveQueryCheckpoints()
+	delete(b.liveQueryCheckpoints, checkpointID)
+}
+
+// ensureLiveQueryCheckpoints lazily seeds the per-proposal live-checkpoint
+// overlay from the committed FSMState set on first use. The copy keeps the
+// overlay independent so a rolled-back proposal leaves FSMState untouched.
+func (b *WriteSet) ensureLiveQueryCheckpoints() {
+	if b.liveQueryCheckpoints != nil {
+		return
+	}
+
+	b.liveQueryCheckpoints = make(map[uint64]struct{}, len(b.fsm.State.LiveQueryCheckpointIDs))
+	for id := range b.fsm.State.LiveQueryCheckpointIDs {
+		b.liveQueryCheckpoints[id] = struct{}{}
+	}
+}
+
+// QueryCheckpointCount returns the number of live query checkpoints, including
+// uncommitted creates and deletes from the current proposal.
+func (b *WriteSet) QueryCheckpointCount() int {
+	b.ensureLiveQueryCheckpoints()
+
+	return len(b.liveQueryCheckpoints)
+}
+
+// QueryCheckpointExists reports whether checkpointID is a live query checkpoint,
+// including uncommitted creates and deletes from the current proposal.
+func (b *WriteSet) QueryCheckpointExists(checkpointID uint64) bool {
+	b.ensureLiveQueryCheckpoints()
+
+	_, ok := b.liveQueryCheckpoints[checkpointID]
+
+	return ok
 }
 
 // BloomUpdates returns the canonical keys collected during Merge for bloom filter updates.

@@ -6,8 +6,17 @@ import (
 	"github.com/formancehq/ledger/v3/internal/proto/raftcmdpb"
 )
 
+// MaxLiveQueryCheckpoints is the fixed cap on the number of query checkpoints
+// that can be live at once. CreateQueryCheckpoint fails once the cap is
+// reached; there is no eviction. Not configurable in v3.0.
+const MaxLiveQueryCheckpoints = 10
+
 func processCreateQueryCheckpoint(order *raftcmdpb.CreateQueryCheckpointOrder, ctx *Context) (*commonpb.LogPayload, domain.Describable) {
 	s := ctx.Scope
+	if s.QueryCheckpointCount() >= MaxLiveQueryCheckpoints {
+		return nil, &domain.ErrCheckpointLimitReached{Limit: MaxLiveQueryCheckpoints}
+	}
+
 	checkpointID := s.IncrementNextQueryCheckpointID()
 
 	cp := &raftcmdpb.QueryCheckpointState{
@@ -33,6 +42,10 @@ func processCreateQueryCheckpoint(order *raftcmdpb.CreateQueryCheckpointOrder, c
 func processDeleteQueryCheckpoint(order *raftcmdpb.DeleteQueryCheckpointOrder, ctx *Context) (*commonpb.LogPayload, domain.Describable) {
 	if order.GetCheckpointId() == 0 {
 		return nil, domain.ErrCheckpointIDRequired
+	}
+
+	if !ctx.Scope.QueryCheckpointExists(order.GetCheckpointId()) {
+		return nil, &domain.ErrCheckpointNotFound{CheckpointID: order.GetCheckpointId()}
 	}
 
 	ctx.Scope.DeleteQueryCheckpoint(order.GetCheckpointId())

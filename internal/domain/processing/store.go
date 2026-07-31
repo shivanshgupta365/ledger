@@ -109,6 +109,11 @@ type Scope interface {
 	IncrementNextQueryCheckpointID() uint64
 	SaveQueryCheckpoint(cp *raftcmdpb.QueryCheckpointState)
 	DeleteQueryCheckpoint(checkpointID uint64)
+	// QueryCheckpointCount / QueryCheckpointExists read the deterministic
+	// replicated live-checkpoint set (FSMState) to gate the fixed cap and make
+	// deletes existence-aware, without a Pebble scan on the apply path.
+	QueryCheckpointCount() int
+	QueryCheckpointExists(checkpointID uint64) bool
 
 	// CheckCoverage exposes the gate for paths that read state directly
 	// (bypassing the engine overlay) and still want the coverage

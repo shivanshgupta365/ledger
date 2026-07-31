@@ -53,3 +53,21 @@ func ListQueryCheckpoints(reader dal.PebbleReader) ([]*raftcmdpb.QueryCheckpoint
 
 	return checkpoints, nil
 }
+
+// ReadLiveQueryCheckpointIDs returns the set of query-checkpoint IDs currently
+// live in the store. Used at recovery to rehydrate FSMState so the FSM can
+// enforce the checkpoint cap and reject deletes of non-live IDs without
+// scanning Pebble on the apply path.
+func ReadLiveQueryCheckpointIDs(reader dal.PebbleReader) (map[uint64]struct{}, error) {
+	checkpoints, err := ListQueryCheckpoints(reader)
+	if err != nil {
+		return nil, err
+	}
+
+	ids := make(map[uint64]struct{}, len(checkpoints))
+	for _, cp := range checkpoints {
+		ids[cp.GetCheckpointId()] = struct{}{}
+	}
+
+	return ids, nil
+}

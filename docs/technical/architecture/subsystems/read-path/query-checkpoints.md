@@ -35,6 +35,17 @@ The read index materializes asynchronously and **per-replica** (step 5). Readine
 
 The `.ready` marker and the checkpoint directories are rebuildable filesystem lifecycle state (a projection of the audit log), not a persisted Pebble projection, so they are outside the checker's scope.
 
+## Retention and the Live Checkpoint Limit
+
+At most **10 query checkpoints** may be live at once (`processing.MaxLiveQueryCheckpoints`). This is a fixed, non-configurable cap — there is no flag/env/CRD field and no automatic eviction.
+
+- **Creation fails at the cap.** Once 10 checkpoints are live, every `CreateQueryCheckpoint` (manual or scheduled) is rejected with `ErrCheckpointLimitReached` — reason `CHECKPOINT_LIMIT_REACHED`, mapped to gRPC `ResourceExhausted` / HTTP 429. Nothing is evicted; an operator must delete a checkpoint to free a slot.
+- **Delete is existence-aware.** `DeleteQueryCheckpoint` for an id that is not live returns `ErrCheckpointNotFound` — reason `CHECKPOINT_NOT_FOUND`, mapped to gRPC `NotFound` / HTTP 404. Only a real deletion emits a `DeletedQueryCheckpointLog`, so the derived live count stays exact.
+- **The count is deterministic replicated FSM state.** The FSM holds the set of live checkpoint IDs (`FSMState.LiveQueryCheckpointIDs`), rehydrated at recovery from the stored `QueryCheckpointState` rows. It is the authoritative, concurrency-safe gate enforced in the apply path (`processCreateQueryCheckpoint`) — never a Pebble scan on the hot path (invariant #3), never the eventually-consistent usagebuilder projection. `NextQueryCheckpointID` is monotonic and is **not** the live count (deletes do not decrement it).
+- **Checker coverage.** The stored checkpoint rows are verified against the audit chain: the checker re-derives the live set from the `CreatedQueryCheckpointLog` / `DeletedQueryCheckpointLog` stream and flags any divergence (`CHECK_STORE_ERROR_TYPE_QUERY_CHECKPOINT_MISMATCH`), per invariant #8.
+
+Because the live cardinality is bounded at 10, `ListQueryCheckpoints` stays small and is intentionally not paginated. If a store already holds more than 10 checkpoints, new creation stays rejected until manual deletions bring the live count back below the cap.
+
 ## Automatic Checkpoint Creation (Cron Scheduler)
 
 Checkpoint creation can be automated via a cron schedule. The schedule is a runtime-modifiable configuration stored in Raft, following the same pattern as chapter schedule (`SetChapterSchedule`).
@@ -65,7 +76,7 @@ The `QueryCheckpointScheduler` runs on every node but only triggers checkpoint c
 2. When the schedule changes, a notification signal wakes the scheduler goroutine to recompute the next fire time.
 3. On leader change, the new leader's scheduler is already running and will fire at the next scheduled time.
 
-Checkpoints accumulate over time. Old checkpoints are **not** automatically cleaned up — use `ledgerctl query-checkpoint delete` to remove them when no longer needed.
+Checkpoints are never automatically evicted, but at most 10 may be live at once (see [Retention and the Live Checkpoint Limit](#retention-and-the-live-checkpoint-limit)). Once the cap is reached the scheduler stops creating checkpoints — logging the condition once rather than on every tick — and resumes automatically after an operator frees a slot with `ledgerctl query-checkpoint delete`.
 
 **File**: `internal/infra/state/query_checkpoint_scheduler.go`
 

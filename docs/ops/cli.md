@@ -154,7 +154,7 @@ collection is bounded by design:
 | `indexes list` | Streamed in full from the `SubAttrIndex` registry; cardinality bounded by ledger config (per-ledger / bucket-scope). |
 | `events list` | Raft-state cluster-wide sink config; cardinality bounded by deployment topology. |
 | `queries list` | Raft-state per-ledger prepared queries; cardinality bounded by ledger config. |
-| `querycheckpoint list` | Replicated state; cardinality bounded by retention policy. |
+| `querycheckpoint list` | Replicated state; cardinality bounded by the fixed cap of 10 live checkpoints. |
 
 These commands still honor `--json` / `--yaml`.
 
@@ -4976,6 +4976,7 @@ ledgerctl query-checkpoint create [flags]
 - The FSM commits pending state and creates a main store Pebble checkpoint; the read index checkpoint is created asynchronously by the index builder
 - Checkpoints are stored under `{dataDir}/query-checkpoints/{id}/main/` and `{dataDir}/query-checkpoints/{id}/readindex/`
 - Not cleaned up on restart — use `query-checkpoint delete` to remove
+- At most 10 checkpoints may be live at once (fixed cap, not configurable). Once reached, creation fails with `CHECKPOINT_LIMIT_REACHED` (gRPC `ResourceExhausted` / HTTP 429); delete a checkpoint to free a slot. There is no automatic eviction.
 
 **Example:**
 

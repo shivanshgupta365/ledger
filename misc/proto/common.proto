@@ -1266,6 +1266,14 @@ enum ErrorReason {
   ERROR_REASON_PRELOAD_UNAVAILABLE = 67;
   ERROR_REASON_AGGREGATE_OVERFLOW = 68;
   ERROR_REASON_BALANCE_NOT_FOUND = 69;
+  // ERROR_REASON_CHECKPOINT_LIMIT_REACHED: a CreateQueryCheckpoint order was
+  // rejected because the cluster already holds the maximum number of live
+  // query checkpoints. Maps to gRPC ResourceExhausted / HTTP 429; delete an
+  // existing checkpoint before creating another.
+  ERROR_REASON_CHECKPOINT_LIMIT_REACHED = 70;
+  // ERROR_REASON_CHECKPOINT_NOT_FOUND: a DeleteQueryCheckpoint order targeted
+  // a checkpoint ID that is not live. Maps to gRPC NotFound / HTTP 404.
+  ERROR_REASON_CHECKPOINT_NOT_FOUND = 71;
 }
 
 // IdempotencyFailure captures a definitive business rejection so a retried key

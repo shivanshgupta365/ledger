@@ -888,6 +888,14 @@ enum CheckStoreErrorType {
   // or a latest pointer that is not the greatest saved semver is tampering. The
   // audit chain is the source of truth.
   CHECK_STORE_ERROR_TYPE_NUMSCRIPT_MISMATCH = 19;
+  // Emitted when a live query-checkpoint row (ZoneGlobal/SubGlobQueryCheckpoint)
+  // is not justified by the audit chain: the checker re-derives the live set from
+  // the CreatedQueryCheckpoint / DeletedQueryCheckpoint logs (baseline-seeded
+  // under archiving) and flags any stored id that was never created or was later
+  // deleted — a phantom, tampered, or stale-undeleted row. The reverse direction
+  // (audited-live but no stored row) is not flagged: checkpoint rows are
+  // deliberately not rebuilt on restore.
+  CHECK_STORE_ERROR_TYPE_QUERY_CHECKPOINT_MISMATCH = 20;
 }
 
 message CheckStoreError {

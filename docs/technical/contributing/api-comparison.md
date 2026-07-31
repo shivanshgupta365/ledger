@@ -911,6 +911,8 @@ Each error response includes a `google.rpc.ErrorInfo` detail with:
 | Invalid apply type (protocol mismatch) | `INTERNAL` | `INVALID_APPLY_TYPE` | `typeName` |
 | Storage operation failed | `INTERNAL` | `STORAGE_OPERATION_FAILED` | `operation` |
 | Checkpoint ID required | `INVALID_ARGUMENT` | `CHECKPOINT_ID_REQUIRED` | *(none)* |
+| Checkpoint limit reached | `RESOURCE_EXHAUSTED` | `CHECKPOINT_LIMIT_REACHED` | `limit` |
+| Checkpoint not found | `NOT_FOUND` | `CHECKPOINT_NOT_FOUND` | `checkpointId` |
 
 ### REST/HTTP Error Mapping
 

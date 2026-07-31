@@ -129,6 +129,14 @@ const (
 	// or a latest pointer that is not the greatest saved semver is tampering. The
 	// audit chain is the source of truth.
 	CheckStoreErrorType_CHECK_STORE_ERROR_TYPE_NUMSCRIPT_MISMATCH CheckStoreErrorType = 19
+	// Emitted when a live query-checkpoint row (ZoneGlobal/SubGlobQueryCheckpoint)
+	// is not justified by the audit chain: the checker re-derives the live set from
+	// the CreatedQueryCheckpoint / DeletedQueryCheckpoint logs (baseline-seeded
+	// under archiving) and flags any stored id that was never created or was later
+	// deleted — a phantom, tampered, or stale-undeleted row. The reverse direction
+	// (audited-live but no stored row) is not flagged: checkpoint rows are
+	// deliberately not rebuilt on restore.
+	CheckStoreErrorType_CHECK_STORE_ERROR_TYPE_QUERY_CHECKPOINT_MISMATCH CheckStoreErrorType = 20
 )
 
 // Enum value maps for CheckStoreErrorType.
@@ -154,6 +162,7 @@ var (
 		17: "CHECK_STORE_ERROR_TYPE_REFERENCE_MISMATCH",
 		18: "CHECK_STORE_ERROR_TYPE_BOUNDARY_MISMATCH",
 		19: "CHECK_STORE_ERROR_TYPE_NUMSCRIPT_MISMATCH",
+		20: "CHECK_STORE_ERROR_TYPE_QUERY_CHECKPOINT_MISMATCH",
 	}
 	CheckStoreErrorType_value = map[string]int32{
 		"CHECK_STORE_ERROR_TYPE_UNSPECIFIED":                 0,
@@ -176,6 +185,7 @@ var (
 		"CHECK_STORE_ERROR_TYPE_REFERENCE_MISMATCH":          17,
 		"CHECK_STORE_ERROR_TYPE_BOUNDARY_MISMATCH":           18,
 		"CHECK_STORE_ERROR_TYPE_NUMSCRIPT_MISMATCH":          19,
+		"CHECK_STORE_ERROR_TYPE_QUERY_CHECKPOINT_MISMATCH":   20,
 	}
 )
 
@@ -9663,7 +9673,7 @@ const file_bucket_proto_rawDesc = "" +
 	"\x12entities_with_null\x18\x05 \x01(\x06R\x10entitiesWithNull\"\x10\n" +
 	"\x0eBarrierRequest\"4\n" +
 	"\x0fBarrierResponse\x12!\n" +
-	"\fcommit_index\x18\x01 \x01(\x06R\vcommitIndex*\xac\a\n" +
+	"\fcommit_index\x18\x01 \x01(\x06R\vcommitIndex*\xe2\a\n" +
 	"\x13CheckStoreErrorType\x12&\n" +
 	"\"CHECK_STORE_ERROR_TYPE_UNSPECIFIED\x10\x00\x12(\n" +
 	"$CHECK_STORE_ERROR_TYPE_HASH_MISMATCH\x10\x01\x12'\n" +
@@ -9685,7 +9695,8 @@ const file_bucket_proto_rawDesc = "" +
 	"'CHECK_STORE_ERROR_TYPE_UNAUDITED_LEDGER\x10\x10\x12-\n" +
 	")CHECK_STORE_ERROR_TYPE_REFERENCE_MISMATCH\x10\x11\x12,\n" +
 	"(CHECK_STORE_ERROR_TYPE_BOUNDARY_MISMATCH\x10\x12\x12-\n" +
-	")CHECK_STORE_ERROR_TYPE_NUMSCRIPT_MISMATCH\x10\x13*W\n" +
+	")CHECK_STORE_ERROR_TYPE_NUMSCRIPT_MISMATCH\x10\x13\x124\n" +
+	"0CHECK_STORE_ERROR_TYPE_QUERY_CHECKPOINT_MISMATCH\x10\x14*W\n" +
 	"\x12PatternSegmentType\x12\x1e\n" +
 	"\x1aPATTERN_SEGMENT_TYPE_FIXED\x10\x00\x12!\n" +
 	"\x1dPATTERN_SEGMENT_TYPE_VARIABLE\x10\x01*\x9c\x01\n" +
