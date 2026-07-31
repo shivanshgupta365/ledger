@@ -706,9 +706,15 @@ const (
 	// failing fast, so the FSM can replay a frozen outcome. If no frozen outcome
 	// exists the FSM emits THIS reason: retryable (Kind=Unavailable), NOT frozen —
 	// a preparation gap, never an authoritative business verdict. See EN-1406.
-	ErrorReason_ERROR_REASON_PRELOAD_UNAVAILABLE ErrorReason = 67
-	ErrorReason_ERROR_REASON_AGGREGATE_OVERFLOW  ErrorReason = 68
-	ErrorReason_ERROR_REASON_BALANCE_NOT_FOUND   ErrorReason = 69
+	ErrorReason_ERROR_REASON_PRELOAD_UNAVAILABLE         ErrorReason = 67
+	ErrorReason_ERROR_REASON_AGGREGATE_OVERFLOW          ErrorReason = 68
+	ErrorReason_ERROR_REASON_BALANCE_NOT_FOUND           ErrorReason = 69
+	ErrorReason_ERROR_REASON_HISTORY_BUILDING            ErrorReason = 70
+	ErrorReason_ERROR_REASON_HISTORY_BEHIND              ErrorReason = 71
+	ErrorReason_ERROR_REASON_HISTORY_EXPIRED             ErrorReason = 72
+	ErrorReason_ERROR_REASON_HISTORY_SOURCE_MISSING      ErrorReason = 73
+	ErrorReason_ERROR_REASON_HISTORY_CORRUPT             ErrorReason = 74
+	ErrorReason_ERROR_REASON_UNSUPPORTED_TEMPORAL_FILTER ErrorReason = 75
 )
 
 // Enum value maps for ErrorReason.
@@ -783,6 +789,12 @@ var (
 		67: "ERROR_REASON_PRELOAD_UNAVAILABLE",
 		68: "ERROR_REASON_AGGREGATE_OVERFLOW",
 		69: "ERROR_REASON_BALANCE_NOT_FOUND",
+		70: "ERROR_REASON_HISTORY_BUILDING",
+		71: "ERROR_REASON_HISTORY_BEHIND",
+		72: "ERROR_REASON_HISTORY_EXPIRED",
+		73: "ERROR_REASON_HISTORY_SOURCE_MISSING",
+		74: "ERROR_REASON_HISTORY_CORRUPT",
+		75: "ERROR_REASON_UNSUPPORTED_TEMPORAL_FILTER",
 	}
 	ErrorReason_value = map[string]int32{
 		"ERROR_REASON_UNSPECIFIED":                      0,
@@ -854,6 +866,12 @@ var (
 		"ERROR_REASON_PRELOAD_UNAVAILABLE":              67,
 		"ERROR_REASON_AGGREGATE_OVERFLOW":               68,
 		"ERROR_REASON_BALANCE_NOT_FOUND":                69,
+		"ERROR_REASON_HISTORY_BUILDING":                 70,
+		"ERROR_REASON_HISTORY_BEHIND":                   71,
+		"ERROR_REASON_HISTORY_EXPIRED":                  72,
+		"ERROR_REASON_HISTORY_SOURCE_MISSING":           73,
+		"ERROR_REASON_HISTORY_CORRUPT":                  74,
+		"ERROR_REASON_UNSUPPORTED_TEMPORAL_FILTER":      75,
 	}
 )
 
@@ -13772,7 +13790,7 @@ const file_common_proto_rawDesc = "" +
 	"\x12LEDGER_MODE_MIRROR\x10\x01*Q\n" +
 	"\x0fMirrorSyncState\x12\x1d\n" +
 	"\x19MIRROR_SYNC_STATE_SYNCING\x10\x00\x12\x1f\n" +
-	"\x1bMIRROR_SYNC_STATE_FOLLOWING\x10\x01*\xbf\x15\n" +
+	"\x1bMIRROR_SYNC_STATE_FOLLOWING\x10\x01*\x9e\x17\n" +
 	"\vErrorReason\x12\x1c\n" +
 	"\x18ERROR_REASON_UNSPECIFIED\x10\x00\x12&\n" +
 	"\"ERROR_REASON_LEDGER_ALREADY_EXISTS\x10\x01\x12!\n" +
@@ -13843,7 +13861,13 @@ const file_common_proto_rawDesc = "" +
 	"$ERROR_REASON_STALE_INPUTS_RESOLUTION\x10B\x12$\n" +
 	" ERROR_REASON_PRELOAD_UNAVAILABLE\x10C\x12#\n" +
 	"\x1fERROR_REASON_AGGREGATE_OVERFLOW\x10D\x12\"\n" +
-	"\x1eERROR_REASON_BALANCE_NOT_FOUND\x10E*Q\n" +
+	"\x1eERROR_REASON_BALANCE_NOT_FOUND\x10E\x12!\n" +
+	"\x1dERROR_REASON_HISTORY_BUILDING\x10F\x12\x1f\n" +
+	"\x1bERROR_REASON_HISTORY_BEHIND\x10G\x12 \n" +
+	"\x1cERROR_REASON_HISTORY_EXPIRED\x10H\x12'\n" +
+	"#ERROR_REASON_HISTORY_SOURCE_MISSING\x10I\x12 \n" +
+	"\x1cERROR_REASON_HISTORY_CORRUPT\x10J\x12,\n" +
+	"(ERROR_REASON_UNSUPPORTED_TEMPORAL_FILTER\x10K*Q\n" +
 	"\x14ChartEnforcementMode\x12\x1c\n" +
 	"\x18CHART_ENFORCEMENT_STRICT\x10\x00\x12\x1b\n" +
 	"\x17CHART_ENFORCEMENT_AUDIT\x10\x01*i\n" +
